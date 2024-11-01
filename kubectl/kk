@@ -1,0 +1,52 @@
+#!/bin/bash
+
+# Set the kube config file path
+KUBECONFIG=~/.kube/config
+
+# Check if kubectl and config file exists
+if ! command -v kubectl &> /dev/null; then
+  echo "kubectl not found. Please install it before running this script."
+  exit 1
+fi
+
+if [ ! -f "$KUBECONFIG" ]; then
+  echo "Kube config file not found at $KUBECONFIG"
+  exit 1
+fi
+
+# Function to display menu for context selection
+select_context() {
+  echo "Available contexts:"
+  CONTEXTS=$(kubectl config get-contexts -o name)
+  
+  select CONTEXT in $CONTEXTS; do
+    if [ -n "$CONTEXT" ]; then
+      echo "Selected context: $CONTEXT"
+      kubectl config use-context "$CONTEXT" > /dev/null
+      select_namespace
+      break
+    else
+      echo "Invalid selection. Please try again."
+    fi
+  done
+}
+
+# Function to display menu for namespace selection
+select_namespace() {
+  echo "Fetching namespaces in the selected context..."
+  NAMESPACES=$(kubectl get namespaces --no-headers -o custom-columns=":metadata.name")
+  
+  select NAMESPACE in $NAMESPACES; do
+    if [ -n "$NAMESPACE" ]; then
+      echo "Selected namespace: $NAMESPACE"
+      kubectl config set-context --current --namespace="$NAMESPACE"
+      echo "Context and namespace set. You can now use kubectl commands in this namespace."
+      break
+    else
+      echo "Invalid selection. Please try again."
+    fi
+  done
+}
+
+# Run the menu
+select_context
