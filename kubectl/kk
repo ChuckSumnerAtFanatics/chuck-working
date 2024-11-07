@@ -41,6 +41,8 @@ select_namespace() {
       echo "Selected namespace: $NAMESPACE"
       kubectl config set-context --current --namespace="$NAMESPACE"
       echo "Context and namespace set. You can now use kubectl commands in this namespace."
+      echo "Available pods in the selected namespace:"
+      kubectl get pods
       break
     else
       echo "Invalid selection. Please try again."
