@@ -1,0 +1,19 @@
+#!/bin/bash
+
+# Exit immediately if a command exits with a non-zero status
+set -e
+
+# Check if pod name is provided
+if [ -z "$1" ]; then
+  echo "Usage: $0 <pod-name>"
+  exit 1
+fi
+
+# Assign the first argument to the pod variable
+pod=$1
+
+# Execute the kubectl exec command
+if ! kubectl exec -ti "${pod}" -- /bin/bash; then
+  echo "Failed to execute kubectl exec command on pod ${pod}"
+  exit 1
+fi
