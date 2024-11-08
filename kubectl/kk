@@ -1,54 +1,187 @@
 #!/bin/bash
 
-# Set the kube config file path
-KUBECONFIG=~/.kube/config
+# Exit on error
+set -e
 
-# Check if kubectl and config file exists
+# Set the kube config file path
+KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Function to print colored output
+print_info() { echo -e "${BLUE}INFO: $1${NC}"; }
+print_success() { echo -e "${GREEN}SUCCESS: $1${NC}"; }
+print_error() { echo -e "${RED}ERROR: $1${NC}" >&2; }
+
+# Check dependencies
 if ! command -v kubectl &> /dev/null; then
-  echo "kubectl not found. Please install it before running this script."
-  exit 1
+    print_error "kubectl not found. Please install it first."
+    exit 1
 fi
 
 if [ ! -f "$KUBECONFIG" ]; then
-  echo "Kube config file not found at $KUBECONFIG"
-  exit 1
+    print_error "Kube config file not found at $KUBECONFIG"
+    exit 1
 fi
 
 # Function to display menu for context selection
 select_context() {
-  echo "Available contexts:"
-  CONTEXTS=$(kubectl config get-contexts -o name)
-  
-  select CONTEXT in $CONTEXTS; do
-    if [ -n "$CONTEXT" ]; then
-      echo "Selected context: $CONTEXT"
-      kubectl config use-context "$CONTEXT" > /dev/null
-      select_namespace
-      break
+    print_info "Available Kubernetes contexts:"
+    echo
+
+    # If arg1 was provided, use filtered contexts, otherwise get all contexts
+    if [ -n "$1" ]; then
+        CONTEXTS=("${FILTERED_CONTEXTS[@]}")
     else
-      echo "Invalid selection. Please try again."
+        CONTEXTS=()
+        while IFS= read -r line; do
+            CONTEXTS+=("$line")
+        done < <(kubectl config get-contexts -o name)
     fi
-  done
+    
+    # Add exit option
+    CONTEXTS+=("Exit")
+    
+    select CONTEXT in "${CONTEXTS[@]}"; do
+        if [ "$CONTEXT" = "Exit" ]; then
+            print_info "Exiting..."
+            exit 0
+        elif [ -n "$CONTEXT" ]; then
+            print_success "Selected context: $CONTEXT"
+            if ! kubectl config use-context "$CONTEXT" &> /dev/null; then
+                print_error "Failed to switch to context $CONTEXT"
+                exit 1
+            fi
+            select_namespace
+            break
+        else
+            print_error "Invalid selection. Please try again."
+        fi
+    done
 }
 
 # Function to display menu for namespace selection
 select_namespace() {
-  echo "Fetching namespaces in the selected context..."
-  NAMESPACES=$(kubectl get namespaces --no-headers -o custom-columns=":metadata.name")
-  
-  select NAMESPACE in $NAMESPACES; do
-    if [ -n "$NAMESPACE" ]; then
-      echo "Selected namespace: $NAMESPACE"
-      kubectl config set-context --current --namespace="$NAMESPACE"
-      echo "Context and namespace set. You can now use kubectl commands in this namespace."
-      echo "Available pods in the selected namespace:"
-      kubectl get pods
-      break
-    else
-      echo "Invalid selection. Please try again."
-    fi
-  done
+    print_info "Fetching namespaces in context $(kubectl config current-context)..."
+    echo
+    
+    # Get namespaces and number them
+    NAMESPACES=()
+    while IFS= read -r line; do
+        NAMESPACES+=("$line")
+    done < <(kubectl get namespaces --no-headers -o custom-columns=":metadata.name")
+    
+    # Add options to go back or exit
+    NAMESPACES+=("Back to contexts" "Exit")
+    
+    select NAMESPACE in "${NAMESPACES[@]}"; do
+        case "$NAMESPACE" in
+            "Back to contexts")
+                select_context
+                return
+                ;;
+            "Exit")
+                print_info "Exiting..."
+                exit 0
+                ;;
+            *)
+                if [ -n "$NAMESPACE" ]; then
+                    print_success "Selected namespace: $NAMESPACE"
+                    if ! kubectl config set-context --current --namespace="$NAMESPACE" &> /dev/null; then
+                        print_error "Failed to set namespace $NAMESPACE"
+                        exit 1
+                    fi
+                    
+                    print_success "Context and namespace configured successfully!"
+                    echo
+                    print_info "Current configuration:"
+                    echo "Context:   $(kubectl config current-context)"
+                    echo "Namespace: $NAMESPACE"
+                    echo
+                    print_info "Available pods:"
+                    
+                    # Get pods and store them in array
+                    PODS=()
+                    while IFS= read -r line; do
+                        PODS+=("$line")
+                    done < <(kubectl get pods --no-headers -o custom-columns=":metadata.name")
+                    
+                    # Add exit option
+                    PODS+=("Exit")
+                    
+                    echo
+                    select POD in "${PODS[@]}"; do
+                        if [ "$POD" = "Exit" ]; then
+                            print_info "Exiting..."
+                            exit 0
+                        elif [ -n "$POD" ]; then
+                            print_success "Connecting to pod: $POD"
+                            if ! kubectl exec -ti "${POD}" -- /bin/bash; then
+                                print_error "Failed to connect to pod $POD"
+                                exit 1
+                            fi
+                            break
+                        else
+                            print_error "Invalid selection. Please try again."
+                        fi
+                    done
+                    break
+                else
+                    print_error "Invalid selection. Please try again."
+                fi
+                ;;
+        esac
+    done
 }
 
-# Run the menu
-select_context
+# Function to filter contexts based on pattern
+filter_contexts() {
+    local pattern="$1"
+    local matches=()
+    
+    while IFS= read -r context; do
+        if [[ "$context" =~ .*"$pattern".* ]]; then
+            matches+=("$context")
+        fi
+    done < <(kubectl config get-contexts -o name)
+    
+    if [ ${#matches[@]} -eq 0 ]; then
+        return 1
+    fi
+    
+    printf '%s\n' "${matches[@]}"
+}
+
+# Main execution
+print_info "Kubernetes Context/Namespace Selector"
+echo "----------------------------------------"
+
+if [ -n "$1" ]; then
+    # If argument provided, filter contexts
+    if ! FILTERED_CONTEXTS=($(filter_contexts "$1")); then
+        print_error "No contexts found matching: $1"
+        exit 1
+    fi
+        
+    if [ ${#FILTERED_CONTEXTS[@]} -eq 1 ]; then
+        # If exactly one match, use it directly
+        CONTEXT="${FILTERED_CONTEXTS[0]}"
+        print_success "Selected context: $CONTEXT"
+        if ! kubectl config use-context "$CONTEXT" &> /dev/null; then
+            print_error "Failed to switch to context $CONTEXT"
+            exit 1
+        fi
+        select_namespace
+    else
+        # Multiple matches, show selection menu
+        print_info "Multiple matches found for: $1"
+        select_context "$1"
+    fi
+else
+    # No argument, show all contexts
+    select_context
+fi
