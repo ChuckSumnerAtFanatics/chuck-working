@@ -120,8 +120,13 @@ select_namespace() {
                             exit 0
                         elif [ -n "$POD" ]; then
                             print_success "Connecting to pod: $POD"
-                            if ! kubectl exec -ti "${POD}" -- /bin/bash; then
-                                print_error "Failed to connect to pod $POD"
+                            # Try /bin/bash first, fall back to /bin/sh
+                            if kubectl exec -ti "${POD}" -- /bin/bash 2>/dev/null; then
+                                break
+                            elif kubectl exec -ti "${POD}" -- /bin/sh 2>/dev/null; then
+                                break
+                            else
+                                print_error "Failed to connect to pod $POD - neither /bin/bash nor /bin/sh available"
                                 exit 1
                             fi
                             break
