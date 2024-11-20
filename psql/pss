@@ -17,7 +17,7 @@ connect_to_env() {
     local env="$1"
     echo "Connecting to: $env"
     export $(poetry run python get_db_creds.py --environment "$env" --user postgres)
-    psql --set=HOSTNAME="${env}" --set=PROMPT1='[%:HOSTNAME:%] %/%R%# '
+    psql --set=PROMPT1="[$env] %/%R%# "
 }
 
 # Check if the first argument is provided
