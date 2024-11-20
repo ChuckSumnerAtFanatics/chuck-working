@@ -16,7 +16,8 @@ IFS=$'\n' read -r -d '' -a env_array <<< "$(echo "$env_names" | grep -v 'data-co
 connect_to_env() {
     local env="$1"
     echo "Connecting to: $env"
-    export $(poetry run python get_db_creds.py --environment "$env" --user postgres) && psql
+    export $(poetry run python get_db_creds.py --environment "$env" --user postgres)
+    psql --set=HOSTNAME="${env}" --set=PROMPT1='[%:HOSTNAME:%] %/%R%# '
 }
 
 # Check if the first argument is provided
