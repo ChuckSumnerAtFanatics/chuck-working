@@ -1,0 +1,61 @@
+#!/bin/bash
+
+# Get the current directory
+ohome=$(pwd)
+phome="/Users/chuck.sumner/workspace/ats-database-scripts/db_provisioner"
+
+cd "${phome}"
+
+# Get the environment names
+env_names=$(grep 'environment_name:' "${phome}/envs/"* | awk -F 'environment_name: ' '{print $2}' | sort)
+
+# Convert the output to an array, ignoring 'data-compute' and 'fbg-local' entries
+IFS=$'\n' read -r -d '' -a env_array <<< "$(echo "$env_names" | grep -v 'data-compute' | grep -v 'fbg-local')"
+
+# Function to connect to the environment
+connect_to_env() {
+    local env="$1"
+    echo "Connecting to: $env"
+    export $(poetry run python get_db_creds.py --environment "$env" --user postgres) && psql
+}
+
+# Check if the first argument is provided
+if [[ -n "$1" ]]; then
+    # Get the partial match
+    partial_match="$1"
+    matches=()
+    for env in "${env_array[@]}"; do
+        if [[ "$env" == *"$partial_match"* ]]; then
+            matches+=("$env")
+        fi
+    done
+
+    # If there is a single match, connect to it
+    if [[ ${#matches[@]} -eq 1 ]]; then
+        connect_to_env "${matches[0]}"
+    else
+        # Display a menu of matching entries
+        echo "Select an environment:"
+        select env in "${matches[@]}"; do
+            if [[ -n "$env" ]]; then
+                connect_to_env "$env"
+                break
+            else
+                echo "Invalid selection. Please try again."
+            fi
+        done
+    fi
+else
+    # Display the menu for all environments
+    echo "Select an environment:"
+    select env in "${env_array[@]}"; do
+        if [[ -n "$env" ]]; then
+            connect_to_env "$env"
+            break
+        else
+            echo "Invalid selection. Please try again."
+        fi
+    done
+fi
+
+cd "${ohome}"
