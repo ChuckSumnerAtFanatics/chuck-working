@@ -29,15 +29,20 @@ if [[ -n "$1" ]]; then
     # Get the partial match
     partial_match="$1"
     matches=()
+    exact_match=""
+
     for env in "${env_array[@]}"; do
-        if [[ "$env" == *"$partial_match"* ]]; then
+        if [[ "$env" == "$partial_match" ]]; then
+            exact_match="$env"
+            break
+        elif [[ "$env" == *"$partial_match"* ]]; then
             matches+=("$env")
         fi
     done
 
-    # If there is a single match, connect to it
-    if [[ ${#matches[@]} -eq 1 ]]; then
-        connect_to_env "${matches[0]}"
+    # If there is an exact match, connect to it
+    if [[ -n "$exact_match" ]]; then
+        connect_to_env "$exact_match"
     else
         # Display a menu of matching entries
         echo "Select an environment:"
