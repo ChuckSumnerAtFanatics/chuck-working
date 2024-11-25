@@ -2,12 +2,16 @@
 
 # Get the current directory
 ohome=$(pwd)
-# Use environment variable if set, otherwise use default path
-phome="${DB_PROVISIONER_HOME:-${HOME}/workspace/ats-database-scripts/db_provisioner}"
-cd "${phome}"
+
+# Set this env var to the path of db_provisioner
+if [ -z "${DB_PROVISIONER_HOME}" ]; then
+    echo "Error: DB_PROVISIONER_HOME environment variable must be set" >&2
+    exit 1
+fi
+cd "${DB_PROVISIONER_HOME}"
 
 # Get the environment names
-env_names=$(grep 'environment_name:' "${phome}/envs/"* | awk -F 'environment_name: ' '{print $2}' | sort)
+env_names=$(grep 'environment_name:' "envs/"* | awk -F 'environment_name: ' '{print $2}' | sort)
 
 # Convert the output to an array, ignoring 'data-compute' and 'fbg-local' entries
 IFS=$'\n' read -r -d '' -a env_array <<< "$(echo "$env_names" | grep -v 'data-compute' | grep -v 'fbg-local')"
