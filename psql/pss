@@ -2,8 +2,8 @@
 
 # Get the current directory
 ohome=$(pwd)
-phome="/Users/chuck.sumner/workspace/ats-database-scripts/db_provisioner"
-
+# Use environment variable if set, otherwise use default path
+phome="${DB_PROVISIONER_HOME:-${HOME}/workspace/ats-database-scripts/db_provisioner}"
 cd "${phome}"
 
 # Get the environment names
