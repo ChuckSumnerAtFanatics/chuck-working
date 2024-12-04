@@ -6,6 +6,7 @@ usage() {
 Usage: pss [OPTIONS] [environment]
 
 Options:
+    -d, --database      Database to connect to (default: postgres)
     -h, --help          Show this help message
     -u, --user USER     Database user (default: postgres)
 
@@ -15,17 +16,32 @@ EOF
     exit 0
 }
 
-# Default values
+# Initialize variables
 DB_USER="postgres"
+DB_NAME="postgres"
 ENV_NAME=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        -d|--database)
+            if [[ -z "$2" ]]; then
+                echo "Error: --database requires an argument" >&2
+                usage
+                exit 1
+            fi
+            DB_NAME="$2"
+            shift 2
+            ;;
         -h|--help)
             usage
             ;;
         -u|--user)
+            if [[ -z "$2" ]]; then
+                echo "Error: --user requires an argument" >&2
+                usage
+                exit 1
+            fi
             DB_USER="$2"
             shift 2
             ;;
@@ -67,12 +83,12 @@ done < <(grep -h 'environment_name:' "envs/"* |
 # Function to connect to the environment
 connect_to_env() {
     local env="$1"
-    echo "Connecting to: ${DB_USER}@$env"
-    export $(poetry run python get_db_creds.py --environment "$env" --user ${DB_USER})
+    echo "Connecting to: $env ${DB_USER}@${DB_NAME}"
+    export $(poetry run python get_db_creds.py --environment "$env" --user "${DB_USER}")
     if [[ "$env" == *"prod"* ]]; then
-        psql --set=PROMPT1="%[%033[1;31m%][$env] %n@%/%R%#%033[0m%] " -d postgres
+        psql --set=PROMPT1="%[%033[1;31m%][$env] %n@%/%R%#%033[0m%] " -d "${DB_NAME}"
     else
-        psql --set=PROMPT1="%[%033[1;32m%][$env] %n@%/%R%#%033[0m%] " -d postgres
+        psql --set=PROMPT1="%[%033[1;32m%][$env] %n@%/%R%#%033[0m%] " -d "${DB_NAME}"
     fi
 }
 
