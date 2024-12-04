@@ -1,5 +1,46 @@
 #!/bin/bash
 
+# Parse arguments
+usage() {
+    cat << EOF
+Usage: pss [OPTIONS] [environment]
+
+Options:
+    -h, --help          Show this help message
+    -u, --user USER     Database user (default: postgres)
+
+Arguments:
+    environment         Full or partial environment name to connect to
+EOF
+    exit 0
+}
+
+# Default values
+DB_USER="postgres"
+ENV_NAME=""
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage
+            ;;
+        -u|--user)
+            DB_USER="$2"
+            shift 2
+            ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            usage
+            exit 1
+            ;;
+        *)
+            ENV_NAME="$1"
+            shift
+            ;;
+    esac
+done
+
 # Get the current directory
 OHOME=$(pwd)
 
@@ -26,27 +67,25 @@ done < <(grep -h 'environment_name:' "envs/"* |
 # Function to connect to the environment
 connect_to_env() {
     local env="$1"
-    echo "Connecting to: $env"
-    export $(poetry run python get_db_creds.py --environment "$env" --user postgres)
+    echo "Connecting to: ${DB_USER}@$env"
+    export $(poetry run python get_db_creds.py --environment "$env" --user ${DB_USER})
     if [[ "$env" == *"prod"* ]]; then
-        psql --set=PROMPT1="%[%033[1;31m%][$env] %/%R%#%[%033[0m%] "
+        psql --set=PROMPT1="%[%033[1;31m%][$env] %n@%/%R%#%033[0m%] " -d postgres
     else
-        psql --set=PROMPT1="%[%033[1;32m%][$env] %/%R%#%[%033[0m%] "
+        psql --set=PROMPT1="%[%033[1;32m%][$env] %n@%/%R%#%033[0m%] " -d postgres
     fi
 }
 
-# Check if the first argument is provided
-if [[ -n "$1" ]]; then
-    # Get the partial match
-    partial_match="$1"
+# Check if environment name is provided
+if [[ -n "${ENV_NAME}" ]]; then
     matches=()
     exact_match=""
 
     for env in "${env_array[@]}"; do
-        if [[ "$env" == "$partial_match" ]]; then
+        if [[ "$env" == "${ENV_NAME}" ]]; then
             exact_match="$env"
             break
-        elif [[ "$env" == *"$partial_match"* ]]; then
+        elif [[ "$env" == *"${ENV_NAME}"* ]]; then
             matches+=("$env")
         fi
     done
@@ -54,8 +93,8 @@ if [[ -n "$1" ]]; then
     # If there is an exact match, connect to it
     if [[ -n "$exact_match" ]]; then
         connect_to_env "$exact_match"
-    else
-        # Display a menu of matching entries
+    elif [[ ${#matches[@]} -gt 0 ]]; then
+        # Display menu of matching entries
         echo "Select an environment:"
         select env in "${matches[@]}"; do
             if [[ -n "$env" ]]; then
@@ -65,18 +104,10 @@ if [[ -n "$1" ]]; then
                 echo "Invalid selection. Please try again."
             fi
         done
+    else
+        echo "No matching environments found for: ${ENV_NAME}" >&2
+        exit 1
     fi
-else
-    # Display the menu for all environments
-    echo "Select an environment:"
-    select env in "${env_array[@]}"; do
-        if [[ -n "$env" ]]; then
-            connect_to_env "$env"
-            break
-        else
-            echo "Invalid selection. Please try again."
-        fi
-    done
 fi
 
 cd "${OHOME}"
