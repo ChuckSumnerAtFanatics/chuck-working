@@ -86,9 +86,9 @@ connect_to_env() {
     echo "Connecting to: $env ${DB_USER}@${DB_NAME}"
     export $(poetry run python get_db_creds.py --environment "$env" --user "${DB_USER}")
     if [[ "$env" == *"prod"* ]]; then
-        psql --set=PROMPT1="%[%033[1;31m%][$env] %n@%/%R%#%033[0m%] " -d "${DB_NAME}"
+        psql --set=PROMPT1="%[%033[1;31m%][${env}] %n@%/%R%#%[%033[0m%] " -d "${DB_NAME}"
     else
-        psql --set=PROMPT1="%[%033[1;32m%][$env] %n@%/%R%#%033[0m%] " -d "${DB_NAME}"
+        psql --set=PROMPT1="%[%033[1;32m%][${env}] %n@%/%R%#%[%033[0m%] " -d "${DB_NAME}"
     fi
 }
 
