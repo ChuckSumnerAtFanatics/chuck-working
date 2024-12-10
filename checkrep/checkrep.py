@@ -85,21 +85,15 @@ def fetch_replication_slots_and_wal_rate(conn):
 
 
 def display_subscriptions(subscriptions):
-    """Display subscription information."""
-    print("=== Subscriptions ===")
+    """Display subscription information in a formatted table."""
+    print("\n=== Subscriptions ===")
+    print(f"{'Name':<20} {'Enabled':<8} {'Publications':<20} {'Worker PID':<10} {'Last Received LSN':<20} {'Latest End LSN':<20} {'Latest End Time':<25} {'Lag':<15}")
+    print("-" * 140)
     for sub in subscriptions:
         lag_seconds = sub["lag_seconds"]
-        lag_display = (
-            f"{int(lag_seconds)} seconds" if lag_seconds is not None else "Unknown"
-        )
-        print(f"- Subscription Name: {sub['subscription_name']}")
-        print(f"  Enabled: {sub['is_enabled']}")
-        print(f"  Publications: {sub['publications']}")
-        print(f"  Worker PID: {sub['worker_pid']}")
-        print(f"  Last Received LSN: {sub['last_received_lsn']}")
-        print(f"  Latest End LSN: {sub['latest_end_lsn']}")
-        print(f"  Latest End Time: {sub['latest_end_time']}")
-        print(f"  Lag: {lag_display}\n")
+        lag_display = f"{int(lag_seconds)} seconds" if lag_seconds is not None else "Unknown"
+        print(f"{sub['subscription_name']:<20} {str(sub['is_enabled']):<8} {sub['publications'][:18]+'...' if len(sub['publications'])>18 else sub['publications']:<20} {str(sub['worker_pid']):<10} {str(sub['last_received_lsn']):<20} {str(sub['latest_end_lsn']):<20} {str(sub['latest_end_time']):<25} {lag_display:<15}")
+    print()
 
 
 def display_replication_slots(slots, wal_rate):
@@ -124,17 +118,14 @@ def estimate_time_in_state(lag_size, wal_rate):
     return str(timedelta(seconds=seconds))
 
 def display_publications(publications):
-    """Display publication details"""
-    print("\nPublications:")
-    print(
-        f"{'Name':<20} {'Owner':<20} {'All Tables':<12} {'Inserts':<8} {'Updates':<8} {'Deletes':<8} {'Truncates':<10}"
-    )
+    """Display publication details in a formatted table."""
+    print("\n=== Publications ===")
+    print(f"{'Name':<20} {'Owner':<20} {'All Tables':<12} {'Inserts':<8} {'Updates':<8} {'Deletes':<8} {'Truncates':<10}")
     print("-" * 86)
     for pub in publications:
         name, owner, all_tables, inserts, updates, deletes, truncates = pub
-        print(
-            f"{name:<20} {owner:<20} {all_tables:<12} {inserts:<8} {updates:<8} {deletes:<8} {truncates:<10}"
-        )
+        print(f"{name:<20} {owner:<20} {str(all_tables):<12} {str(inserts):<8} {str(updates):<8} {str(deletes):<8} {str(truncates):<10}")
+    print()
 
 def format_bytes(size):
     """Convert a size in bytes to a human-readable format."""
