@@ -77,7 +77,7 @@ while IFS= read -r line; do
 done < <(grep -h 'environment_name:' "envs/"* | 
         cut -d':' -f2 | 
         sed 's/^ *//g' |
-        grep -Ev 'data-compute|fbg-local' |
+        grep -Ev 'data-compute' |
         sort)
 
 # Function to connect to the environment
@@ -85,10 +85,14 @@ connect_to_env() {
     local env="$1"
     echo "Connecting to: $env ${DB_USER}@${DB_NAME}"
     export $(poetry run python get_db_creds.py --environment "$env" --user "${DB_USER}")
+    psql="/opt/homebrew/opt/postgresql@16/bin/psql"
+
     if [[ "$env" == *"prod"* ]]; then
-        psql --set=PROMPT1="%[%033[1;31m%][${env}] %n@%/%R%#%[%033[0m%] " -d "${DB_NAME}"
+        $psql --set=PROMPT1="%[%033[1;31m%][${env}] %n@%/%R%#%[%033[0m%] " -d "${DB_NAME}"
+    elif [[ "$env" == *"local"* ]]; then
+        $psql --set=PROMPT1="%[%033[1;36m%][${env}] %n@%/%R%#%[%033[0m%] " -d "${DB_NAME}"
     else
-        psql --set=PROMPT1="%[%033[1;32m%][${env}] %n@%/%R%#%[%033[0m%] " -d "${DB_NAME}"
+        $psql --set=PROMPT1="%[%033[1;32m%][${env}] %n@%/%R%#%[%033[0m%] " -d "${DB_NAME}"
     fi
 }
 
