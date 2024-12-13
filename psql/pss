@@ -96,8 +96,23 @@ connect_to_env() {
     fi
 }
 
+# Function to display menu of all environments
+display_menu() {
+    echo "Select an environment:"
+    select env in "${env_array[@]}"; do
+        if [[ -n "$env" ]]; then
+            connect_to_env "$env"
+            break
+        else
+            echo "Invalid selection. Please try again."
+        fi
+    done
+}
+
 # Check if environment name is provided
-if [[ -n "${ENV_NAME}" ]]; then
+if [[ -z "${ENV_NAME}" ]]; then
+    display_menu
+else
     matches=()
     exact_match=""
 
