@@ -1,5 +1,10 @@
 #!/bin/bash
 
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    echo "Error: This script must be sourced. Please run: source $(basename ${0})" >&2
+    exit 1
+fi
+
 # Parse arguments
 usage() {
     cat << EOF
@@ -13,42 +18,27 @@ Options:
 Arguments:
     environment         Full or partial environment name to connect to
 EOF
-    exit 0
+    return 0
 }
 
 # Initialize variables
-DB_USER="replication"
+DB_USER="postgres"
 DB_NAME="postgres"
 ENV_NAME=""
 
-# Parse arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        -h|--help)
+            usage
+            return 0
+            ;;
         -d|--database)
-            if [[ -z "$2" ]]; then
-                echo "Error: --database requires an argument" >&2
-                usage
-                exit 1
-            fi
             DB_NAME="$2"
             shift 2
             ;;
-        -h|--help)
-            usage
-            ;;
         -u|--user)
-            if [[ -z "$2" ]]; then
-                echo "Error: --user requires an argument" >&2
-                usage
-                exit 1
-            fi
             DB_USER="$2"
             shift 2
-            ;;
-        -*)
-            echo "Unknown option: $1" >&2
-            usage
-            exit 1
             ;;
         *)
             ENV_NAME="$1"
@@ -122,4 +112,12 @@ if [[ -n "${ENV_NAME}" ]]; then
     fi
 fi
 
-cd "${OHOME}"
+# Add cleanup function at end of script
+finish() {
+    echo "Current PostgreSQL related environment variables:"
+    env | grep PG
+    cd "${OHOME}"
+}
+
+# Call finish function at end of script
+finish
