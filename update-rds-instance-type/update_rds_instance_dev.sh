@@ -6,7 +6,7 @@
 # 17.x -> 17.3
 
 # what env?
-env="dev"
+env="inf-dev"
 
 # Declare an associative array to store unique cluster-region pairs
 declare -A seen_clusters
