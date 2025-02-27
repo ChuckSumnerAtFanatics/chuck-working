@@ -102,6 +102,10 @@ select_namespace() {
                     echo "Context:   $(kubectl config current-context)"
                     echo "Namespace: $NAMESPACE"
                     echo
+                    # to just use k9s, uncomment the following 2 lines
+                    k9s --context $CONTEXT --namespace $NAMESPACE
+                    break
+
                     print_info "Available pods:"
                     
                     # Get pods and store them in array

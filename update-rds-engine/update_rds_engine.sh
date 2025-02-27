@@ -1,12 +1,12 @@
 #!/bin/bash
 
-# 13.x -> 13.19
+# 13.x -> 13.20
 # 14.x -> 14.16
 # 16.x -> 16.7
 # 17.x -> 17.3
 
 # what env?
-env="test"
+env="cert"
 
 export AWS_PAGER=""
 
@@ -29,7 +29,7 @@ grep -A1 aws_account_name $DB_PROVISIONER_HOME/envs/${env}-env.yaml | awk '{ pri
 
         echo ${cluster}
         for rds in $(aws-vault exec $CLUSTER.AdministratorAccess -- aws rds describe-db-instances --region ${REGION} | jq -r '.DBInstances[].DBInstanceIdentifier'); do
-          for instance in $(aws-vault exec $CLUSTER.AdministratorAccess -- aws rds describe-db-instances --db-instance-identifier ${rds} --region ${REGION} | jq -r '.DBInstances[] | .DBInstanceIdentifier'); do
+          for instance in $(aws-vault exec $CLUSTER.AdministratorAccess -- aws rds describe-db-instances --db-instance-identifier ${rds} --region ${REGION} | jq -r '.DBInstances[] | select(.EngineVersion | startswith("13.")) | .DBInstanceIdentifier'); do
             aws-vault exec $CLUSTER.AdministratorAccess -- aws rds describe-db-instances --db-instance-identifier ${instance} --region ${REGION} | jq -r '.DBInstances[] | "  \(.DBInstanceIdentifier): \(.EngineVersion)"'
           done
         done

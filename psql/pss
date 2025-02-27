@@ -74,7 +74,7 @@ cd "${DB_PROVISIONER_HOME}"
 env_array=()
 while IFS= read -r line; do
     [[ -n "$line" ]] && env_array+=("$line")
-done < <(grep -h 'environment_name:' "envs/"* | 
+done < <(grep -h 'environment_name:' "${DB_PROVISIONER_HOME}/envs/"* | 
         cut -d':' -f2 | 
         sed 's/^ *//g' |
         grep -Ev 'data-compute' |
@@ -85,6 +85,7 @@ connect_to_env() {
     local env="$1"
     echo "Connecting to: $env ${DB_USER}@${DB_NAME}"
     export $(poetry run python get_db_creds.py --environment "$env" --user "${DB_USER}")
+    #export $(fbg postgres get-credentials --env "$env" --user "${DB_USER}" "$env")
     psql="/opt/homebrew/opt/postgresql@16/bin/psql"
 
     if [[ "$env" == *"prod"* ]]; then
