@@ -175,10 +175,19 @@ def get_replication_status(host: str) -> Dict[str, Any]:
                 cur.execute("SELECT subname, subenabled, subconninfo FROM pg_subscription")
                 status['logical_subscriptions'] = cur.fetchall()
 
-                logging.info(f"Fetching table sync status for {host}")
-                status['table_sync_status'] = get_table_sync_status(conn)
-                logging.info(f"Checking inactive replication for {host}")
-                status['inactive_replication'] = check_inactive_replication(conn)
+                try:
+                    logging.info(f"Fetching table sync status for {host}")
+                    status['table_sync_status'] = get_table_sync_status(conn)
+                except Exception as e:
+                    logging.error(f"Error getting table sync status: {e}")
+                    status['table_sync_status'] = {'error': str(e)}
+
+                try:
+                    logging.info(f"Checking inactive replication for {host}")
+                    status['inactive_replication'] = check_inactive_replication(conn)
+                except Exception as e:
+                    logging.error(f"Error checking inactive replication: {e}")
+                    status['inactive_replication'] = {'error': str(e)}
         finally:
             connection_pools[host].putconn(conn)
     except Exception as e:
@@ -192,11 +201,11 @@ def get_table_sync_status(conn: psycopg2.extensions.connection) -> Dict[str, Any
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT schemaname, tablename, 
-                       (pg_size_pretty(pg_total_relation_size('"' || schemaname || '"."' || tablename || '"'))),
+                SELECT schemaname, table_name, 
+                       (pg_size_pretty(pg_total_relation_size('"' || schemaname || '"."' || table_name || '"'))),
                        n_live_tup, n_dead_tup, last_vacuum, last_analyze
                 FROM pg_stat_user_tables
-                ORDER BY pg_total_relation_size('"' || schemaname || '"."' || tablename || '"') DESC
+                ORDER BY pg_total_relation_size('"' || schemaname || '"."' || table_name || '"') DESC
             """)
             sync_status['tables'] = cur.fetchall()
     except psycopg2.Error as e:
@@ -256,10 +265,10 @@ def generate_replication_report(topology: Dict[str, List[str]], statuses: Dict[s
         "replication_lag": {}
     }
 
-    for publisher in topology['publishers']:
+    for publisher in topology['logical_publishers']:
         publisher_status = statuses.get(publisher, {})
-        if publisher_status.get('is_publisher'):
-            for rep_stat in publisher_status.get('replication_stats', []):
+        if publisher_status.get('is_logical_publisher'):
+            for rep_stat in publisher_status.get('logical_replication_stats', []):
                 subscriber = rep_stat['client_addr']
                 lag = calculate_replication_lag(rep_stat['sent_lsn'], rep_stat['replay_lsn'])
                 report['replication_lag'][f"{publisher}->{subscriber}"] = lag
