@@ -59,7 +59,7 @@ def handle_exception(e: Exception, context: str) -> None:
 # Global connection pool
 connection_pools: Dict[str, SimpleConnectionPool] = {}
 
-def get_db_connection(host: str) -> psycopg2.extensions.connection:
+def get_db_connection(host: str, user: Optional[str] = None, password: Optional[str] = None) -> psycopg2.extensions.connection:
     global connection_pools
     if host not in connection_pools:
         connection_pools[host] = SimpleConnectionPool(
@@ -67,25 +67,25 @@ def get_db_connection(host: str) -> psycopg2.extensions.connection:
             host=host,
             port=os.environ.get('PGPORT', 5432),
             database=os.environ.get('PGDATABASE', 'postgres'),
-            user=os.environ.get('PGUSER', 'postgres'),
-            password=os.environ.get('PGPASSWORD'),
+            user=user or os.environ.get('PGUSER', 'postgres'),
+            password=password or os.environ.get('PGPASSWORD'),
             cursor_factory=DictCursor
         )
     logging.info(f"Establishing connection to host: {host}")
     return connection_pools[host].getconn()
 
-def discover_replication_topology(start_host: str) -> Dict[str, Any]:
+def discover_replication_topology(start_host: str, start_user: str, start_password: str) -> Dict[str, Any]:
     topology = {'logical_publishers': [], 'logical_subscribers': []}
     visited = set()
 
-    def dfs(host: str) -> None:
+    def dfs(host: str, user: str, password: str) -> None:
         if host in visited:
             return
         visited.add(host)
         logging.info(f"Exploring host: {host}")
 
         try:
-            conn = get_db_connection(host)
+            conn = get_db_connection(host, user, password)
             try:
                 with conn.cursor() as cur:
                     # Check for logical publications
@@ -102,9 +102,14 @@ def discover_replication_topology(start_host: str) -> Dict[str, Any]:
                         logging.info(f"Found logical subscribers for {host}: {logical_subscribers}")
                         topology['logical_subscribers'].extend(logical_subscribers)
                         
+                        # Get replication user credentials for subscribers
+                        cur.execute("SELECT rolname, rolpassword FROM pg_authid WHERE rolreplication")
+                        replication_users = cur.fetchall()
+                        
                         # Recursively check logical subscribers
                         for subscriber in logical_subscribers:
-                            dfs(subscriber)
+                            for rep_user in replication_users:
+                                dfs(subscriber, rep_user['rolname'], rep_user['rolpassword'])
                     
                     # Check for logical subscriptions
                     cur.execute("SELECT count(*) FROM pg_subscription")
@@ -119,25 +124,30 @@ def discover_replication_topology(start_host: str) -> Dict[str, Any]:
                         cur.execute("SELECT subconninfo FROM pg_subscription")
                         for row in cur.fetchall():
                             conninfo = row['subconninfo']
-                            publisher = parse_conninfo(conninfo)
+                            publisher, pub_user, pub_password = parse_conninfo(conninfo)
                             if publisher and publisher not in topology['logical_publishers']:
                                 logging.info(f"Found logical publisher for {host}: {publisher}")
                                 topology['logical_publishers'].append(publisher)
-                                dfs(publisher)
+                                dfs(publisher, pub_user, pub_password)
             finally:
                 connection_pools[host].putconn(conn)
         except psycopg2.Error as e:
             logging.error(f"Error connecting to {host}: {e}")
 
-    dfs(start_host)
+    dfs(start_host, start_user, start_password)
     return topology
 
-def parse_conninfo(conninfo: str) -> Optional[str]:
+def parse_conninfo(conninfo: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    host = user = password = None
     parts = conninfo.split()
     for part in parts:
         if part.startswith('host='):
-            return part.split('=')[1]
-    return None
+            host = part.split('=')[1]
+        elif part.startswith('user='):
+            user = part.split('=')[1]
+        elif part.startswith('password='):
+            password = part.split('=')[1]
+    return host, user, password
 
 def get_replication_status(host: str) -> Dict[str, Any]:
     status = {}
@@ -296,15 +306,21 @@ def main() -> None:
         sys.exit(1)
 
     try:
+        start_user = os.environ.get('PGUSER', 'postgres')
+        password = get_password()
+        if not password:
+            logging.error("No password provided. Set PGPASSWORD environment variable or enter it when prompted.")
+            sys.exit(1)
+
         logging.info("Discovering replication topology...")
-        topology = discover_replication_topology(start_host)
+        topology = discover_replication_topology(start_host, start_user, password)
         logging.info("Topology discovery completed")
         logging.debug(f"Discovered topology: {json.dumps(topology, indent=2)}")
 
         max_workers = config['monitoring']['max_workers']
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_host = {executor.submit(process_host, host): host 
-                              for host in topology['publishers'] + topology['subscribers']}
+                              for host in topology['logical_publishers'] + topology['logical_subscribers']}
             statuses = {}
             for future in as_completed(future_to_host):
                 host, status = future.result()
