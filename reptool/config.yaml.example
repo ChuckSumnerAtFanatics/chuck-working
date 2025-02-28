@@ -1,0 +1,9 @@
+logging:
+  level: ERROR  # Can be DEBUG, INFO, WARNING, ERROR, or CRITICAL
+
+output:
+  default_format: json
+  report_file: replication_report.json  # Name of the output file for JSON reports
+
+monitoring:
+  max_workers: 10  # Maximum number of concurrent threads for processing hosts
