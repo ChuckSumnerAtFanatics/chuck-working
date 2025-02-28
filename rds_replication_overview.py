@@ -1,27 +1,41 @@
 import psycopg2
 import json
 from psycopg2.extras import DictCursor
+from psycopg2.pool import SimpleConnectionPool
+import logging
+from typing import Dict, List, Any, Optional
 
-def get_db_connection(host, password):
-    return psycopg2.connect(
-        host=host,
-        database="postgres",
-        user="postgres",
-        password=password,
-        cursor_factory=DictCursor
-    )
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def discover_replication_topology(start_host, password):
+# Global connection pool
+connection_pools: Dict[str, SimpleConnectionPool] = {}
+
+def get_db_connection(host: str, password: str) -> psycopg2.extensions.connection:
+    global connection_pools
+    if host not in connection_pools:
+        connection_pools[host] = SimpleConnectionPool(
+            1, 5,
+            host=host,
+            database="postgres",
+            user="postgres",
+            password=password,
+            cursor_factory=DictCursor
+        )
+    return connection_pools[host].getconn()
+
+def discover_replication_topology(start_host: str, password: str) -> Dict[str, List[str]]:
     topology = {'publishers': [], 'subscribers': []}
     visited = set()
 
-    def dfs(host):
+    def dfs(host: str) -> None:
         if host in visited:
             return
         visited.add(host)
 
         try:
-            with get_db_connection(host, password) as conn:
+            conn = get_db_connection(host, password)
+            try:
                 with conn.cursor() as cur:
                     # Check if it's a publisher
                     cur.execute("SELECT * FROM pg_replication_slots")
@@ -30,7 +44,7 @@ def discover_replication_topology(start_host, password):
                         
                         # Get subscribers
                         cur.execute("SELECT client_addr FROM pg_stat_replication")
-                        subscribers = [row['client_addr'] for row in cur.fetchall()]
+                        subscribers = [row['client_addr'] for row in cur.fetchall() if row['client_addr']]
                         topology['subscribers'].extend(subscribers)
                         
                         # Recursively check subscribers
@@ -40,18 +54,27 @@ def discover_replication_topology(start_host, password):
                         topology['subscribers'].append(host)
                         
                         # Check if it's subscribed to any publisher
-                        cur.execute("SELECT origin FROM pg_subscription")
-                        publishers = [row['origin'] for row in cur.fetchall()]
-                        topology['publishers'].extend(publishers)
-                        
-                        # Recursively check publishers
-                        for publisher in publishers:
-                            dfs(publisher)
+                        cur.execute("SELECT subconninfo FROM pg_subscription")
+                        for row in cur.fetchall():
+                            conninfo = row['subconninfo']
+                            publisher = parse_conninfo(conninfo)
+                            if publisher:
+                                topology['publishers'].append(publisher)
+                                dfs(publisher)
+            finally:
+                connection_pools[host].putconn(conn)
         except psycopg2.Error as e:
-            print(f"Error connecting to {host}: {e}")
+            logging.error(f"Error connecting to {host}: {e}")
 
     dfs(start_host)
     return topology
+
+def parse_conninfo(conninfo: str) -> Optional[str]:
+    parts = conninfo.split()
+    for part in parts:
+        if part.startswith('host='):
+            return part.split('=')[1]
+    return None
 
 def get_replication_status(host, password):
     # Placeholder for get_replication_status implementation
