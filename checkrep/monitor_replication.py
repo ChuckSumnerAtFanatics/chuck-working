@@ -96,6 +96,13 @@ def fetch_subscriber_info(conn):
         "subscription_status": subscription_status,
     }
 
+def lsn_to_int(lsn):
+    """Convert LSN string to integer."""
+    if lsn is None:
+        return None
+    parts = lsn.split('/')
+    return (int(parts[0], 16) << 32) + int(parts[1], 16)
+
 def calculate_replication_lag(publisher_info, subscriber_info):
     """Calculate replication lag based on LSN differences."""
     lag_info = {}
@@ -103,8 +110,11 @@ def calculate_replication_lag(publisher_info, subscriber_info):
         for sub_status in subscriber_info['subscription_status']:
             if slot['slot_name'] == sub_status['subscription_name']:
                 if slot['confirmed_flush_lsn'] and sub_status['received_lsn']:
-                    lag = int(slot['confirmed_flush_lsn'], 16) - int(sub_status['received_lsn'], 16)
-                    lag_info[slot['slot_name']] = lag
+                    publisher_lsn = lsn_to_int(slot['confirmed_flush_lsn'])
+                    subscriber_lsn = lsn_to_int(sub_status['received_lsn'])
+                    if publisher_lsn is not None and subscriber_lsn is not None:
+                        lag = publisher_lsn - subscriber_lsn
+                        lag_info[slot['slot_name']] = lag
     return lag_info
 
 def monitor_replication(publisher_params, subscriber_params):
