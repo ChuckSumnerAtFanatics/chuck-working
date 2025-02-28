@@ -325,7 +325,7 @@ def main() -> None:
 
     try:
         logging.info("Discovering replication topology...")
-        topology = discover_replication_topology(start_host, password)
+        topology = discover_replication_topology(start_host)
         logging.info("Topology discovery completed")
         logging.debug(f"Discovered topology: {json.dumps(topology, indent=2)}")
 
