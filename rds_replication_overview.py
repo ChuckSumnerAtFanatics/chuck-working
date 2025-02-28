@@ -1,12 +1,15 @@
 import psycopg2
 import json
+import os
+import argparse
 from psycopg2.extras import DictCursor
 from psycopg2.pool import SimpleConnectionPool
 import logging
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+def setup_logging(log_level):
+    logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Global connection pool
 connection_pools: Dict[str, SimpleConnectionPool] = {}
@@ -172,26 +175,55 @@ def generate_replication_report(topology: Dict[str, List[str]], statuses: Dict[s
 
     return report
 
+def get_password():
+    return os.environ.get('DB_PASSWORD') or input("Enter the password: ")
+
+def process_host(host: str, password: str) -> Tuple[str, Dict[str, Any]]:
+    try:
+        status = get_replication_status(host, password)
+        logging.info(f"Successfully processed host: {host}")
+        return host, status
+    except Exception as e:
+        logging.error(f"Error processing host {host}: {str(e)}")
+        return host, {"error": str(e)}
+
 def main() -> None:
-    start_host = input("Enter the starting host: ")
-    password = input("Enter the password: ")
+    parser = argparse.ArgumentParser(description="RDS Replication Overview Tool")
+    parser.add_argument("start_host", help="Starting host for topology discovery")
+    parser.add_argument("--log-level", choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+                        default='INFO', help="Set the logging level")
+    parser.add_argument("--output", choices=['json', 'csv'], default='json',
+                        help="Output format for the report")
+    args = parser.parse_args()
+
+    setup_logging(args.log_level)
+
+    password = get_password()
 
     try:
-        topology = discover_replication_topology(start_host, password)
-        
-        statuses = {}
-        for host in topology['publishers'] + topology['subscribers']:
-            statuses[host] = get_replication_status(host, password)
+        topology = discover_replication_topology(args.start_host, password)
+        logging.info("Topology discovery completed")
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_host = {executor.submit(process_host, host, password): host 
+                              for host in topology['publishers'] + topology['subscribers']}
+            statuses = {}
+            for future in as_completed(future_to_host):
+                host, status = future.result()
+                statuses[host] = status
 
         report = generate_replication_report(topology, statuses)
 
-        print(json.dumps(report, indent=2))
+        if args.output == 'json':
+            print(json.dumps(report, indent=2))
+            with open('replication_report.json', 'w') as f:
+                json.dump(report, f, indent=2)
+        elif args.output == 'csv':
+            # TODO: Implement CSV output
+            logging.warning("CSV output not yet implemented")
 
-        # Optionally, save the report to a file
-        with open('replication_report.json', 'w') as f:
-            json.dump(report, f, indent=2)
     except Exception as e:
-        logging.error(f"An error occurred: {e}")
+        logging.critical(f"An error occurred: {str(e)}")
     finally:
         # Close all connection pools
         for pool in connection_pools.values():
