@@ -271,7 +271,7 @@ def get_password():
 
 def process_host(host: str, password: str) -> Tuple[str, Dict[str, Any]]:
     try:
-        status = get_replication_status(host, password)
+        status = get_replication_status(host)  # Remove the password argument here
         logging.info(f"Successfully processed host: {host}")
         return host, status
     except Exception as e:
@@ -319,7 +319,7 @@ def main() -> None:
 
         max_workers = config['monitoring']['max_workers']
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_host = {executor.submit(process_host, host): host 
+            future_to_host = {executor.submit(process_host, host, password): host 
                               for host in topology['logical_publishers'] + topology['logical_subscribers']}
             statuses = {}
             for future in as_completed(future_to_host):
