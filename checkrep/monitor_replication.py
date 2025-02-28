@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import os
 import psycopg2
 from psycopg2.extras import DictCursor
 from datetime import datetime
@@ -17,8 +16,12 @@ REPLICATION_STATE_DESCRIPTIONS = {
 
 def get_db_connection(db_params):
     """Establish a connection using provided database parameters."""
-    conn = psycopg2.connect(**db_params)
-    return conn
+    try:
+        conn = psycopg2.connect(**db_params)
+        return conn
+    except psycopg2.Error as e:
+        print(f"Error connecting to the database: {e}")
+        return None
 
 def fetch_publisher_info(conn):
     """Fetch replication information for the publisher."""
@@ -164,13 +167,34 @@ def export_to_json(status, filename):
 
 def main():
     parser = argparse.ArgumentParser(description="Monitor PostgreSQL replication status")
-    parser.add_argument("--publisher", required=True, help="Publisher connection string")
-    parser.add_argument("--subscriber", required=True, help="Subscriber connection string")
+    parser.add_argument("--publisher-host", required=True, help="Publisher host")
+    parser.add_argument("--publisher-port", default="5432", help="Publisher port")
+    parser.add_argument("--publisher-dbname", required=True, help="Publisher database name")
+    parser.add_argument("--publisher-user", required=True, help="Publisher username")
+    parser.add_argument("--publisher-password", required=True, help="Publisher password")
+    parser.add_argument("--subscriber-host", required=True, help="Subscriber host")
+    parser.add_argument("--subscriber-port", default="5432", help="Subscriber port")
+    parser.add_argument("--subscriber-dbname", required=True, help="Subscriber database name")
+    parser.add_argument("--subscriber-user", required=True, help="Subscriber username")
+    parser.add_argument("--subscriber-password", required=True, help="Subscriber password")
     parser.add_argument("--output", help="Output JSON file")
     args = parser.parse_args()
 
-    publisher_params = dict(param.split('=') for param in args.publisher.split())
-    subscriber_params = dict(param.split('=') for param in args.subscriber.split())
+    publisher_params = {
+        "host": args.publisher_host,
+        "port": args.publisher_port,
+        "dbname": args.publisher_dbname,
+        "user": args.publisher_user,
+        "password": args.publisher_password,
+    }
+
+    subscriber_params = {
+        "host": args.subscriber_host,
+        "port": args.subscriber_port,
+        "dbname": args.subscriber_dbname,
+        "user": args.subscriber_user,
+        "password": args.subscriber_password,
+    }
 
     status = monitor_replication(publisher_params, subscriber_params)
     
