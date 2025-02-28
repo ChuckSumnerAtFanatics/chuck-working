@@ -284,7 +284,8 @@ def main() -> None:
         topology = discover_replication_topology(args.start_host, password)
         logging.info("Topology discovery completed")
 
-        with ThreadPoolExecutor(max_workers=config.get('monitoring', {}).get('max_workers', 10)) as executor:
+        max_workers = config['monitoring']['max_workers']
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_host = {executor.submit(process_host, host, password): host 
                               for host in topology['publishers'] + topology['subscribers']}
             statuses = {}
@@ -300,6 +301,8 @@ def main() -> None:
             print(json.dumps(report, indent=2))
             with open(config['output']['report_file'], 'w') as f:
                 json.dump(report, f, indent=2)
+        elif output_format == 'csv':
+            logging.warning("CSV output format is not yet implemented")
         else:
             logging.warning(f"Unsupported output format: {output_format}")
 
