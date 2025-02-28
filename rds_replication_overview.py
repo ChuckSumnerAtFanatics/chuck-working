@@ -3,7 +3,7 @@ import json
 import os
 import sys
 import argparse
-import yaml
+import json
 from psycopg2.extras import DictCursor
 from psycopg2.pool import SimpleConnectionPool
 import logging
@@ -39,9 +39,9 @@ def assess_replication_health(report: Dict[str, Any]) -> Dict[str, Any]:
 
     return health_status
 
-def load_config(config_file='config.yaml'):
+def load_config(config_file='config.json'):
     with open(config_file, 'r') as f:
-        return yaml.safe_load(f)
+        return json.load(f)
 
 def setup_logging(log_level):
     logging.basicConfig(
