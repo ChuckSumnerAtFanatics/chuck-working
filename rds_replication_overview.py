@@ -58,17 +58,19 @@ def handle_exception(e: Exception, context: str) -> None:
 # Global connection pool
 connection_pools: Dict[str, SimpleConnectionPool] = {}
 
-def get_db_connection(host: str, password: str) -> psycopg2.extensions.connection:
+def get_db_connection(host: str) -> psycopg2.extensions.connection:
     global connection_pools
     if host not in connection_pools:
         connection_pools[host] = SimpleConnectionPool(
             1, 5,
             host=host,
-            database="postgres",
-            user="postgres",
-            password=password,
+            port=os.environ.get('PGPORT', 5432),
+            database=os.environ.get('PGDATABASE', 'postgres'),
+            user=os.environ.get('PGUSER', 'postgres'),
+            password=os.environ.get('PGPASSWORD'),
             cursor_factory=DictCursor
         )
+    logging.info(f"Establishing connection to host: {host}")
     return connection_pools[host].getconn()
 
 def discover_replication_topology(start_host: str, password: str) -> Dict[str, List[str]]:
@@ -79,25 +81,29 @@ def discover_replication_topology(start_host: str, password: str) -> Dict[str, L
         if host in visited:
             return
         visited.add(host)
+        logging.info(f"Exploring host: {host}")
 
         try:
-            conn = get_db_connection(host, password)
+            conn = get_db_connection(host)
             try:
                 with conn.cursor() as cur:
                     # Check if it's a publisher
                     cur.execute("SELECT * FROM pg_replication_slots")
                     if cur.fetchone():
+                        logging.info(f"Host {host} is a publisher")
                         topology['publishers'].append(host)
                         
                         # Get subscribers
                         cur.execute("SELECT client_addr FROM pg_stat_replication")
                         subscribers = [row['client_addr'] for row in cur.fetchall() if row['client_addr']]
+                        logging.info(f"Found subscribers for {host}: {subscribers}")
                         topology['subscribers'].extend(subscribers)
                         
                         # Recursively check subscribers
                         for subscriber in subscribers:
                             dfs(subscriber)
                     else:
+                        logging.info(f"Host {host} is a subscriber")
                         topology['subscribers'].append(host)
                         
                         # Check if it's subscribed to any publisher
@@ -106,6 +112,7 @@ def discover_replication_topology(start_host: str, password: str) -> Dict[str, L
                             conninfo = row['subconninfo']
                             publisher = parse_conninfo(conninfo)
                             if publisher:
+                                logging.info(f"Found publisher for {host}: {publisher}")
                                 topology['publishers'].append(publisher)
                                 dfs(publisher)
             finally:
@@ -123,46 +130,45 @@ def parse_conninfo(conninfo: str) -> Optional[str]:
             return part.split('=')[1]
     return None
 
-def get_replication_status(host: str, password: str) -> Dict[str, Any]:
+def get_replication_status(host: str) -> Dict[str, Any]:
     status = {}
+    logging.info(f"Getting replication status for host: {host}")
     try:
-        conn = get_db_connection(host, password)
+        conn = get_db_connection(host)
         try:
             with conn.cursor() as cur:
                 # Check if it's a publisher
                 cur.execute("SELECT * FROM pg_replication_slots")
                 is_publisher = cur.fetchone() is not None
                 status['is_publisher'] = is_publisher
+                logging.info(f"Host {host} is {'a publisher' if is_publisher else 'not a publisher'}")
 
                 if is_publisher:
-                    cur.execute("""
-                        SELECT slot_name, active, restart_lsn
-                        FROM pg_replication_slots
-                    """)
+                    logging.info(f"Fetching replication slots for {host}")
+                    cur.execute("SELECT slot_name, active, restart_lsn FROM pg_replication_slots")
                     status['replication_slots'] = cur.fetchall()
 
-                    cur.execute("""
-                        SELECT client_addr, state, sent_lsn, write_lsn, flush_lsn, replay_lsn
-                        FROM pg_stat_replication
-                    """)
+                    logging.info(f"Fetching replication stats for {host}")
+                    cur.execute("SELECT client_addr, state, sent_lsn, write_lsn, flush_lsn, replay_lsn FROM pg_stat_replication")
                     status['replication_stats'] = cur.fetchall()
 
                     # Compare schema with subscribers
                     for subscriber in status['replication_stats']:
                         subscriber_host = subscriber['client_addr']
-                        subscriber_conn = get_db_connection(subscriber_host, password)
+                        logging.info(f"Comparing schema between {host} and {subscriber_host}")
+                        subscriber_conn = get_db_connection(subscriber_host)
                         try:
                             status['schema_differences'] = compare_schemas(conn, subscriber_conn)
                         finally:
                             connection_pools[subscriber_host].putconn(subscriber_conn)
                 else:
-                    cur.execute("""
-                        SELECT subname, subenabled, subconninfo
-                        FROM pg_subscription
-                    """)
+                    logging.info(f"Fetching subscriptions for {host}")
+                    cur.execute("SELECT subname, subenabled, subconninfo FROM pg_subscription")
                     status['subscriptions'] = cur.fetchall()
 
+                logging.info(f"Fetching table sync status for {host}")
                 status['table_sync_status'] = get_table_sync_status(conn)
+                logging.info(f"Checking inactive replication for {host}")
                 status['inactive_replication'] = check_inactive_replication(conn)
         finally:
             connection_pools[host].putconn(conn)
@@ -252,7 +258,7 @@ def generate_replication_report(topology: Dict[str, List[str]], statuses: Dict[s
     return report
 
 def get_password():
-    return os.environ.get('DB_PASSWORD') or input("Enter the password: ")
+    return os.environ.get('PGPASSWORD') or input("Enter the password: ")
 
 def process_host(host: str, password: str) -> Tuple[str, Dict[str, Any]]:
     try:
@@ -265,7 +271,7 @@ def process_host(host: str, password: str) -> Tuple[str, Dict[str, Any]]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="RDS Replication Overview Tool")
-    parser.add_argument("start_host", help="Starting host for topology discovery")
+    parser.add_argument("--start-host", help="Starting host for topology discovery (overrides PGHOST)")
     parser.add_argument("--config", default="config.yaml", help="Path to configuration file")
     parser.add_argument("--log-level", choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
                         help="Set the logging level (overrides config file)")
@@ -278,15 +284,27 @@ def main() -> None:
     log_level = args.log_level or config['logging']['level']
     setup_logging(log_level)
 
+    start_host = args.start_host or os.environ.get('PGHOST')
+    if not start_host:
+        logging.error("No start host provided. Use --start-host or set PGHOST environment variable.")
+        sys.exit(1)
+
+    logging.info(f"Starting replication overview for host: {start_host}")
+
     password = get_password()
+    if not password:
+        logging.error("No password provided. Set PGPASSWORD environment variable or enter it when prompted.")
+        sys.exit(1)
 
     try:
-        topology = discover_replication_topology(args.start_host, password)
+        logging.info("Discovering replication topology...")
+        topology = discover_replication_topology(start_host, password)
         logging.info("Topology discovery completed")
+        logging.debug(f"Discovered topology: {json.dumps(topology, indent=2)}")
 
         max_workers = config['monitoring']['max_workers']
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_host = {executor.submit(process_host, host, password): host 
+            future_to_host = {executor.submit(process_host, host): host 
                               for host in topology['publishers'] + topology['subscribers']}
             statuses = {}
             for future in as_completed(future_to_host):
