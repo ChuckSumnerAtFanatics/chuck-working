@@ -1,6 +1,7 @@
 import psycopg2
 import json
 import os
+import sys
 import argparse
 import yaml
 from psycopg2.extras import DictCursor
