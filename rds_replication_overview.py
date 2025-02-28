@@ -9,12 +9,51 @@ import logging
 from typing import Dict, List, Any, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+def assess_replication_health(report: Dict[str, Any]) -> Dict[str, Any]:
+    health_status = {
+        'overall': 'HEALTHY',
+        'issues': []
+    }
+
+    for link, lag in report['replication_lag'].items():
+        if lag is not None and lag > 1000000:  # More than 1MB behind
+            health_status['issues'].append(f"High replication lag in {link}: {lag} bytes")
+            health_status['overall'] = 'WARNING'
+
+    for host, status in report['instance_statuses'].items():
+        if status.get('inactive_replication', {}).get('inactive_slots'):
+            health_status['issues'].append(f"Inactive replication slots on {host}")
+            health_status['overall'] = 'WARNING'
+
+        if status.get('schema_differences'):
+            health_status['issues'].append(f"Schema differences detected on {host}")
+            health_status['overall'] = 'WARNING'
+
+        if 'error' in status:
+            health_status['issues'].append(f"Error on {host}: {status['error']}")
+            health_status['overall'] = 'CRITICAL'
+
+    if len(health_status['issues']) > 5:
+        health_status['overall'] = 'CRITICAL'
+
+    return health_status
+
 def load_config(config_file='config.yaml'):
     with open(config_file, 'r') as f:
         return yaml.safe_load(f)
 
 def setup_logging(log_level):
-    logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
+    logging.basicConfig(
+        level=log_level,
+        format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+def handle_exception(e: Exception, context: str) -> None:
+    error_message = f"An error occurred during {context}: {str(e)}"
+    logging.error(error_message)
+    if isinstance(e, psycopg2.Error):
+        logging.error(f"Database error details: {e.diag.message_primary}")
 
 # Global connection pool
 connection_pools: Dict[str, SimpleConnectionPool] = {}
@@ -127,8 +166,8 @@ def get_replication_status(host: str, password: str) -> Dict[str, Any]:
                 status['inactive_replication'] = check_inactive_replication(conn)
         finally:
             connection_pools[host].putconn(conn)
-    except psycopg2.Error as e:
-        logging.error(f"Error getting replication status for {host}: {e}")
+    except Exception as e:
+        handle_exception(e, f"getting replication status for {host}")
         status['error'] = str(e)
 
     return status
@@ -254,18 +293,18 @@ def main() -> None:
                 statuses[host] = status
 
         report = generate_replication_report(topology, statuses)
+        report['health_assessment'] = assess_replication_health(report)
 
         output_format = args.output or config['output']['default_format']
         if output_format == 'json':
             print(json.dumps(report, indent=2))
             with open(config['output']['report_file'], 'w') as f:
                 json.dump(report, f, indent=2)
-        elif output_format == 'csv':
-            # TODO: Implement CSV output
-            logging.warning("CSV output not yet implemented")
+        else:
+            logging.warning(f"Unsupported output format: {output_format}")
 
     except Exception as e:
-        logging.critical(f"An error occurred: {str(e)}")
+        handle_exception(e, "main execution")
     finally:
         # Close all connection pools
         for pool in connection_pools.values():
