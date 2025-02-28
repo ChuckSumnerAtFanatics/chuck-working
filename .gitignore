@@ -1,3 +1,4 @@
 config.yaml
 dump_schema/*.sql
 .DS_Store
+reptool/replication_report.json

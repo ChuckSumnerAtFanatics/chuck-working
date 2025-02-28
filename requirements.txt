@@ -1,2 +1,0 @@
-psycopg2-binary==2.9.5
-PyYAML==6.0 --no-binary PyYAML

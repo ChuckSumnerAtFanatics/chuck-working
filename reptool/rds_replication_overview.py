@@ -1,14 +1,24 @@
 import psycopg2
 import json
+from decimal import Decimal
+
 import os
 import sys
 import argparse
-import json
-from psycopg2.extras import DictCursor
-from psycopg2.pool import SimpleConnectionPool
 import logging
 from typing import Dict, List, Any, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from psycopg2.extras import DictCursor
+from psycopg2.pool import SimpleConnectionPool
+import yaml  # Import the PyYAML library
+
+
+def convert_decimal(obj):
+    """Convert Decimal objects to float before JSON serialization."""
+    if isinstance(obj, Decimal):
+        return float(obj)
+    raise TypeError(f"Type {type(obj)} not serializable")
+
 
 def assess_replication_health(report: Dict[str, Any]) -> Dict[str, Any]:
     health_status = {
@@ -39,9 +49,9 @@ def assess_replication_health(report: Dict[str, Any]) -> Dict[str, Any]:
 
     return health_status
 
-def load_config(config_file='config.json'):
+def load_config(config_file='config.yaml'):  # Changed default to config.yaml
     with open(config_file, 'r') as f:
-        return json.load(f)
+        return yaml.safe_load(f)  # Use yaml.safe_load() for YAML
 
 def setup_logging(log_level):
     logging.basicConfig(
@@ -74,11 +84,13 @@ def get_db_connection(host: str, user: Optional[str] = None, password: Optional[
     logging.info(f"Establishing connection to host: {host}")
     return connection_pools[host].getconn()
 
-def discover_replication_topology(start_host: str, start_user: str, start_password: str) -> Dict[str, Any]:
-    topology = {'logical_publishers': [], 'logical_subscribers': []}
+def discover_replication_topology(
+    start_host: str, start_user: str, start_password: str
+) -> Dict[str, Any]:
+    topology = {"links": {}, "logical_publishers": [], "logical_subscribers": []}
     visited = set()
 
-    def dfs(host: str, user: str, password: str) -> None:
+    def dfs(host: str, user: str, password: str):
         if host in visited:
             return
         visited.add(host)
@@ -88,47 +100,51 @@ def discover_replication_topology(start_host: str, start_user: str, start_passwo
             conn = get_db_connection(host, user, password)
             try:
                 with conn.cursor() as cur:
-                    # Check for logical publications
-                    cur.execute("SELECT count(*) FROM pg_publication")
-                    is_logical_publisher = cur.fetchone()[0] > 0
+                    # Get logical subscriptions (subscribers)
+                    cur.execute("SELECT subname, subconninfo FROM pg_subscription")
+                    subscriptions = cur.fetchall()
 
-                    if is_logical_publisher:
+                    if subscriptions:
+                        topology["logical_subscribers"].append(host)
+
+                    for subname, conninfo in subscriptions:
+                        pub_host, pub_user, pub_pass = parse_conninfo(conninfo)
+                        logging.info(f"{host} subscribes to {pub_host} via {subname}")
+
+                        # Store replication link
+                        topology["links"].setdefault(pub_host, []).append(host)
+
+                        # Recursively explore the publisher
+                        dfs(pub_host, pub_user, pub_pass)
+
+                    # Check if this host is also a logical publisher
+                    cur.execute("""
+                        SELECT slot_name, active 
+                        FROM pg_replication_slots 
+                        WHERE slot_type = 'logical'
+                    """)
+                    slots = cur.fetchall()
+
+                    if slots:
                         logging.info(f"Host {host} is a logical publisher")
-                        topology['logical_publishers'].append(host)
-                        
-                        # Get logical subscribers
-                        cur.execute("SELECT client_addr FROM pg_stat_replication WHERE application_name LIKE 'logical%'")
-                        logical_subscribers = [row['client_addr'] for row in cur.fetchall() if row['client_addr']]
-                        logging.info(f"Found logical subscribers for {host}: {logical_subscribers}")
-                        topology['logical_subscribers'].extend(logical_subscribers)
-                        
-                        # Get replication user credentials for subscribers
-                        cur.execute("SELECT rolname, rolpassword FROM pg_authid WHERE rolreplication")
-                        replication_users = cur.fetchall()
-                        
-                        # Recursively check logical subscribers
-                        for subscriber in logical_subscribers:
-                            for rep_user in replication_users:
-                                dfs(subscriber, rep_user['rolname'], rep_user['rolpassword'])
-                    
-                    # Check for logical subscriptions
-                    cur.execute("SELECT count(*) FROM pg_subscription")
-                    is_logical_subscriber = cur.fetchone()[0] > 0
-                    
-                    if is_logical_subscriber:
-                        logging.info(f"Host {host} is a logical subscriber")
-                        if host not in topology['logical_subscribers']:
-                            topology['logical_subscribers'].append(host)
-                        
-                        # Get publishers from subscriptions
-                        cur.execute("SELECT subconninfo FROM pg_subscription")
-                        for row in cur.fetchall():
-                            conninfo = row['subconninfo']
-                            publisher, pub_user, pub_password = parse_conninfo(conninfo)
-                            if publisher and publisher not in topology['logical_publishers']:
-                                logging.info(f"Found logical publisher for {host}: {publisher}")
-                                topology['logical_publishers'].append(publisher)
-                                dfs(publisher, pub_user, pub_password)
+                        topology["logical_publishers"].append(host)
+
+                        # Identify its own subscribers
+                        cur.execute("SELECT subname, subconninfo FROM pg_subscription")
+                        new_subscriptions = cur.fetchall()
+
+                        for subname, conninfo in new_subscriptions:
+                            sub_host, sub_user, sub_pass = parse_conninfo(conninfo)
+                            logging.info(
+                                f"{host} also acts as a publisher for {sub_host} via {subname}"
+                            )
+
+                            # Store additional replication link
+                            topology["links"].setdefault(host, []).append(sub_host)
+
+                            # Recursively explore the subscriber (which is also a publisher)
+                            dfs(sub_host, sub_user, sub_pass)
+
             finally:
                 connection_pools[host].putconn(conn)
         except psycopg2.Error as e:
@@ -150,67 +166,83 @@ def parse_conninfo(conninfo: str) -> Tuple[Optional[str], Optional[str], Optiona
     return host, user, password
 
 def get_replication_status(host: str) -> Dict[str, Any]:
-    status = {}
+    status = {"replication_slots": {}, "lagging_slots": []}
     logging.info(f"Getting replication status for host: {host}")
+
     try:
         conn = get_db_connection(host)
         try:
             with conn.cursor() as cur:
-                # Check for logical publications
-                cur.execute("SELECT count(*) FROM pg_publication")
-                is_logical_publisher = cur.fetchone()[0] > 0
-                status['is_logical_publisher'] = is_logical_publisher
+                # Get LSN for the publisher
+                cur.execute("SELECT pg_current_wal_lsn()")
+                publisher_lsn = cur.fetchone()[0]
 
-                if is_logical_publisher:
-                    logging.info(f"Fetching logical replication slots for {host}")
-                    cur.execute("SELECT slot_name, plugin, slot_type, database, active FROM pg_replication_slots WHERE slot_type = 'logical'")
-                    status['logical_replication_slots'] = cur.fetchall()
+                # Get replication slot information
+                cur.execute("""
+                    SELECT slot_name, 
+                        pg_current_wal_lsn() - COALESCE(confirmed_flush_lsn, '0/0') AS lag_bytes, 
+                        confirmed_flush_lsn,
+                        active
+                    FROM pg_replication_slots
+                    WHERE slot_type = 'logical'
+                """)
+                for slot_name, lag_bytes, flush_lsn, active in cur.fetchall():
+                    if isinstance(lag_bytes, Decimal):
+                        lag_bytes = float(lag_bytes)
 
-                    logging.info(f"Fetching logical replication stats for {host}")
-                    cur.execute("SELECT client_addr, state, sent_lsn, write_lsn, flush_lsn, replay_lsn FROM pg_stat_replication WHERE application_name LIKE 'logical%'")
-                    status['logical_replication_stats'] = cur.fetchall()
+                    # Convert bytes to MB, rounding to 2 decimal places
+                    lag_mb = round(lag_bytes / 1_048_576, 2)
 
-                # Check for logical subscriptions
-                logging.info(f"Fetching logical subscriptions for {host}")
-                cur.execute("SELECT subname, subenabled, subconninfo FROM pg_subscription")
-                status['logical_subscriptions'] = cur.fetchall()
+                    status["replication_slots"][slot_name] = {
+                        "flush_lsn": str(
+                            flush_lsn
+                        ),  # Store as string for JSON compatibility
+                        "lag_mb": lag_mb,  # Display lag in MB
+                        "active": active,
+                    }
 
-                try:
-                    logging.info(f"Fetching table sync status for {host}")
-                    status['table_sync_status'] = get_table_sync_status(conn)
-                except Exception as e:
-                    logging.error(f"Error getting table sync status: {e}")
-                    status['table_sync_status'] = {'error': str(e)}
+                    if lag_mb > 1:  # More than 1MB behind
+                        status["lagging_slots"].append(slot_name)
 
-                try:
-                    logging.info(f"Checking inactive replication for {host}")
-                    status['inactive_replication'] = check_inactive_replication(conn)
-                except Exception as e:
-                    logging.error(f"Error checking inactive replication: {e}")
-                    status['inactive_replication'] = {'error': str(e)}
         finally:
             connection_pools[host].putconn(conn)
     except Exception as e:
         handle_exception(e, f"getting replication status for {host}")
-        status['error'] = str(e)
+        status["error"] = str(e)
 
     return status
 
 def get_table_sync_status(conn: psycopg2.extensions.connection) -> Dict[str, Any]:
-    sync_status = {}
+    sync_status = {"mismatched_tables": []}
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT schemaname, table_name, 
-                       (pg_size_pretty(pg_total_relation_size('"' || schemaname || '"."' || table_name || '"'))),
-                       n_live_tup, n_dead_tup, last_vacuum, last_analyze
+                SELECT schemaname, relname AS table_name, n_live_tup
                 FROM pg_stat_user_tables
-                ORDER BY pg_total_relation_size('"' || schemaname || '"."' || table_name || '"') DESC
             """)
-            sync_status['tables'] = cur.fetchall()
+            table_counts = {row[1]: row[2] for row in cur.fetchall()}
+
+            # Compare subscriber table row counts
+            cur.execute("""
+                SELECT schemaname, relname AS table_name, n_live_tup
+                FROM pg_stat_subscription_tables
+            """)
+            for table, sub_count in cur.fetchall():
+                pub_count = table_counts.get(table, None)
+                if pub_count and abs(pub_count - sub_count) > 1000:  # Allow small drift
+                    sync_status["mismatched_tables"].append(
+                        {
+                            "table": table,
+                            "publisher_rows": pub_count,
+                            "subscriber_rows": sub_count,
+                            "difference": abs(pub_count - sub_count),
+                        }
+                    )
+
     except psycopg2.Error as e:
         logging.error(f"Error getting table sync status: {e}")
-        sync_status['error'] = str(e)
+        sync_status["error"] = str(e)
+
     return sync_status
 
 def check_inactive_replication(conn: psycopg2.extensions.connection) -> Dict[str, Any]:
@@ -227,7 +259,11 @@ def check_inactive_replication(conn: psycopg2.extensions.connection) -> Dict[str
         inactive['error'] = str(e)
     return inactive
 
-def calculate_replication_lag(publisher_lsn: str, subscriber_lsn: str) -> Optional[int]:
+def calculate_replication_lag(
+    publisher_lsn: str, subscriber_lsn: Optional[str]
+) -> Optional[int]:
+    if not publisher_lsn or not subscriber_lsn:  # Handle NULL LSNs
+        return None
     try:
         publisher_lsn = int(publisher_lsn, 16)
         subscriber_lsn = int(subscriber_lsn, 16)
@@ -290,7 +326,7 @@ def process_host(host: str, password: str) -> Tuple[str, Dict[str, Any]]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="RDS Replication Overview Tool")
     parser.add_argument("--start-host", help="Starting host for topology discovery (overrides PGHOST)")
-    parser.add_argument("--config", default="config.yaml", help="Path to configuration file")
+    parser.add_argument("--config", default="config.yaml", help="Path to configuration file")  # Changed default to config.yaml
     parser.add_argument("--log-level", choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
                         help="Set the logging level (overrides config file)")
     parser.add_argument("--output", choices=['json', 'csv'],
@@ -340,9 +376,9 @@ def main() -> None:
 
         output_format = args.output or config['output']['default_format']
         if output_format == 'json':
-            print(json.dumps(report, indent=2))
+            print(json.dumps(report, indent=2, default=convert_decimal))
             with open(config['output']['report_file'], 'w') as f:
-                json.dump(report, f, indent=2)
+                json.dump(report, f, indent=2, default=convert_decimal)
         elif output_format == 'csv':
             logging.warning("CSV output format is not yet implemented")
         else:
