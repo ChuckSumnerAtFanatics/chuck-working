@@ -2,11 +2,16 @@ import psycopg2
 import json
 import os
 import argparse
+import yaml
 from psycopg2.extras import DictCursor
 from psycopg2.pool import SimpleConnectionPool
 import logging
 from typing import Dict, List, Any, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+def load_config(config_file='config.yaml'):
+    with open(config_file, 'r') as f:
+        return yaml.safe_load(f)
 
 def setup_logging(log_level):
     logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -102,6 +107,15 @@ def get_replication_status(host: str, password: str) -> Dict[str, Any]:
                         FROM pg_stat_replication
                     """)
                     status['replication_stats'] = cur.fetchall()
+
+                    # Compare schema with subscribers
+                    for subscriber in status['replication_stats']:
+                        subscriber_host = subscriber['client_addr']
+                        subscriber_conn = get_db_connection(subscriber_host, password)
+                        try:
+                            status['schema_differences'] = compare_schemas(conn, subscriber_conn)
+                        finally:
+                            connection_pools[subscriber_host].putconn(subscriber_conn)
                 else:
                     cur.execute("""
                         SELECT subname, subenabled, subconninfo
@@ -158,6 +172,29 @@ def calculate_replication_lag(publisher_lsn: str, subscriber_lsn: str) -> Option
     except ValueError:
         return None
 
+def compare_schemas(conn1: psycopg2.extensions.connection, conn2: psycopg2.extensions.connection) -> List[Tuple[str, str, str]]:
+    differences = []
+    
+    def get_schema(conn):
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT table_name, column_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                ORDER BY table_name, ordinal_position
+            """)
+            return cur.fetchall()
+    
+    schema1 = get_schema(conn1)
+    schema2 = get_schema(conn2)
+    
+    if schema1 != schema2:
+        set1 = set(schema1)
+        set2 = set(schema2)
+        differences = list(set1 ^ set2)
+    
+    return differences
+
 def generate_replication_report(topology: Dict[str, List[str]], statuses: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     report = {
         "topology": topology,
@@ -190,13 +227,17 @@ def process_host(host: str, password: str) -> Tuple[str, Dict[str, Any]]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="RDS Replication Overview Tool")
     parser.add_argument("start_host", help="Starting host for topology discovery")
+    parser.add_argument("--config", default="config.yaml", help="Path to configuration file")
     parser.add_argument("--log-level", choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
-                        default='INFO', help="Set the logging level")
-    parser.add_argument("--output", choices=['json', 'csv'], default='json',
-                        help="Output format for the report")
+                        help="Set the logging level (overrides config file)")
+    parser.add_argument("--output", choices=['json', 'csv'],
+                        help="Output format for the report (overrides config file)")
     args = parser.parse_args()
 
-    setup_logging(args.log_level)
+    config = load_config(args.config)
+
+    log_level = args.log_level or config['logging']['level']
+    setup_logging(log_level)
 
     password = get_password()
 
@@ -204,7 +245,7 @@ def main() -> None:
         topology = discover_replication_topology(args.start_host, password)
         logging.info("Topology discovery completed")
 
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        with ThreadPoolExecutor(max_workers=config.get('monitoring', {}).get('max_workers', 10)) as executor:
             future_to_host = {executor.submit(process_host, host, password): host 
                               for host in topology['publishers'] + topology['subscribers']}
             statuses = {}
@@ -214,11 +255,12 @@ def main() -> None:
 
         report = generate_replication_report(topology, statuses)
 
-        if args.output == 'json':
+        output_format = args.output or config['output']['default_format']
+        if output_format == 'json':
             print(json.dumps(report, indent=2))
-            with open('replication_report.json', 'w') as f:
+            with open(config['output']['report_file'], 'w') as f:
                 json.dump(report, f, indent=2)
-        elif args.output == 'csv':
+        elif output_format == 'csv':
             # TODO: Implement CSV output
             logging.warning("CSV output not yet implemented")
 
