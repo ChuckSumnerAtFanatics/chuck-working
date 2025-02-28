@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
+import os
+import sys
 import psycopg2
 from psycopg2.extras import DictCursor
 from datetime import datetime
-import argparse
 import json
 
 # Reuse the REPLICATION_STATE_DESCRIPTIONS from checkrep.py
@@ -166,42 +167,38 @@ def export_to_json(status, filename):
     print(f"Replication status exported to {filename}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Monitor PostgreSQL replication status")
-    parser.add_argument("--publisher-host", required=True, help="Publisher host")
-    parser.add_argument("--publisher-port", default="5432", help="Publisher port")
-    parser.add_argument("--publisher-dbname", required=True, help="Publisher database name")
-    parser.add_argument("--publisher-user", required=True, help="Publisher username")
-    parser.add_argument("--publisher-password", required=True, help="Publisher password")
-    parser.add_argument("--subscriber-host", required=True, help="Subscriber host")
-    parser.add_argument("--subscriber-port", default="5432", help="Subscriber port")
-    parser.add_argument("--subscriber-dbname", required=True, help="Subscriber database name")
-    parser.add_argument("--subscriber-user", required=True, help="Subscriber username")
-    parser.add_argument("--subscriber-password", required=True, help="Subscriber password")
-    parser.add_argument("--output", help="Output JSON file")
-    args = parser.parse_args()
-
     publisher_params = {
-        "host": args.publisher_host,
-        "port": args.publisher_port,
-        "dbname": args.publisher_dbname,
-        "user": args.publisher_user,
-        "password": args.publisher_password,
+        "host": os.environ.get("PUBLISHER_HOST"),
+        "port": os.environ.get("PUBLISHER_PORT", "5432"),
+        "dbname": os.environ.get("PUBLISHER_DBNAME"),
+        "user": os.environ.get("PUBLISHER_USER"),
+        "password": os.environ.get("PUBLISHER_PASSWORD"),
     }
 
     subscriber_params = {
-        "host": args.subscriber_host,
-        "port": args.subscriber_port,
-        "dbname": args.subscriber_dbname,
-        "user": args.subscriber_user,
-        "password": args.subscriber_password,
+        "host": os.environ.get("SUBSCRIBER_HOST"),
+        "port": os.environ.get("SUBSCRIBER_PORT", "5432"),
+        "dbname": os.environ.get("SUBSCRIBER_DBNAME"),
+        "user": os.environ.get("SUBSCRIBER_USER"),
+        "password": os.environ.get("SUBSCRIBER_PASSWORD"),
     }
+
+    output_file = os.environ.get("OUTPUT_FILE")
+
+    if not all(publisher_params.values()) or not all(subscriber_params.values()):
+        print("Error: All environment variables must be set.")
+        print("Required variables:")
+        print("PUBLISHER_HOST, PUBLISHER_PORT, PUBLISHER_DBNAME, PUBLISHER_USER, PUBLISHER_PASSWORD")
+        print("SUBSCRIBER_HOST, SUBSCRIBER_PORT, SUBSCRIBER_DBNAME, SUBSCRIBER_USER, SUBSCRIBER_PASSWORD")
+        print("Optional: OUTPUT_FILE")
+        sys.exit(1)
 
     status = monitor_replication(publisher_params, subscriber_params)
     
     if status:
         display_replication_status(status)
-        if args.output:
-            export_to_json(status, args.output)
+        if output_file:
+            export_to_json(status, output_file)
 
 if __name__ == "__main__":
     main()
