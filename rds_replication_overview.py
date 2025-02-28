@@ -74,8 +74,8 @@ def get_db_connection(host: str) -> psycopg2.extensions.connection:
     logging.info(f"Establishing connection to host: {host}")
     return connection_pools[host].getconn()
 
-def discover_replication_topology(start_host: str, password: str) -> Dict[str, List[str]]:
-    topology = {'publishers': [], 'subscribers': []}
+def discover_replication_topology(start_host: str) -> Dict[str, Any]:
+    topology = {'logical_publishers': [], 'logical_subscribers': [], 'physical_primary': None, 'physical_replicas': []}
     visited = set()
 
     def dfs(host: str) -> None:
@@ -88,34 +88,50 @@ def discover_replication_topology(start_host: str, password: str) -> Dict[str, L
             conn = get_db_connection(host)
             try:
                 with conn.cursor() as cur:
-                    # Check if it's a publisher
-                    cur.execute("SELECT * FROM pg_replication_slots")
-                    if cur.fetchone():
-                        logging.info(f"Host {host} is a publisher")
-                        topology['publishers'].append(host)
+                    # Check if it's in recovery (physical replica)
+                    cur.execute("SELECT pg_is_in_recovery()")
+                    is_in_recovery = cur.fetchone()[0]
+
+                    if not is_in_recovery:
+                        # This is either a physical primary or a logical publisher (or both)
+                        if not topology['physical_primary']:
+                            topology['physical_primary'] = host
                         
-                        # Get subscribers
-                        cur.execute("SELECT client_addr FROM pg_stat_replication")
-                        subscribers = [row['client_addr'] for row in cur.fetchall() if row['client_addr']]
-                        logging.info(f"Found subscribers for {host}: {subscribers}")
-                        topology['subscribers'].extend(subscribers)
+                        # Check for logical publications
+                        cur.execute("SELECT count(*) FROM pg_publication")
+                        if cur.fetchone()[0] > 0:
+                            topology['logical_publishers'].append(host)
                         
-                        # Recursively check subscribers
-                        for subscriber in subscribers:
-                            dfs(subscriber)
+                        # Get physical replicas
+                        cur.execute("SELECT client_addr FROM pg_stat_replication WHERE application_name NOT LIKE 'logical%'")
+                        physical_replicas = [row['client_addr'] for row in cur.fetchall() if row['client_addr']]
+                        topology['physical_replicas'].extend(physical_replicas)
+                        
+                        # Get logical subscribers
+                        cur.execute("SELECT client_addr FROM pg_stat_replication WHERE application_name LIKE 'logical%'")
+                        logical_subscribers = [row['client_addr'] for row in cur.fetchall() if row['client_addr']]
+                        topology['logical_subscribers'].extend(logical_subscribers)
+                        
+                        # Recursively check all replicas and subscribers
+                        for replica in physical_replicas + logical_subscribers:
+                            dfs(replica)
                     else:
-                        logging.info(f"Host {host} is a subscriber")
-                        topology['subscribers'].append(host)
+                        # This is either a physical replica or a logical subscriber (or both)
+                        if host not in topology['physical_replicas']:
+                            topology['physical_replicas'].append(host)
                         
-                        # Check if it's subscribed to any publisher
-                        cur.execute("SELECT subconninfo FROM pg_subscription")
-                        for row in cur.fetchall():
-                            conninfo = row['subconninfo']
-                            publisher = parse_conninfo(conninfo)
-                            if publisher:
-                                logging.info(f"Found publisher for {host}: {publisher}")
-                                topology['publishers'].append(publisher)
-                                dfs(publisher)
+                        # Check for logical subscriptions
+                        cur.execute("SELECT count(*) FROM pg_subscription")
+                        if cur.fetchone()[0] > 0:
+                            topology['logical_subscribers'].append(host)
+                        
+                        # Get primary server info for physical replication
+                        cur.execute("SELECT primary_conninfo FROM pg_stat_wal_receiver")
+                        primary_conninfo = cur.fetchone()
+                        if primary_conninfo:
+                            primary_host = parse_conninfo(primary_conninfo[0])
+                            if primary_host:
+                                dfs(primary_host)
             finally:
                 connection_pools[host].putconn(conn)
         except psycopg2.Error as e:
@@ -138,34 +154,44 @@ def get_replication_status(host: str) -> Dict[str, Any]:
         conn = get_db_connection(host)
         try:
             with conn.cursor() as cur:
-                # Check if it's a publisher
-                cur.execute("SELECT * FROM pg_replication_slots")
-                is_publisher = cur.fetchone() is not None
-                status['is_publisher'] = is_publisher
-                logging.info(f"Host {host} is {'a publisher' if is_publisher else 'not a publisher'}")
+                # Check if it's in recovery (physical replica)
+                cur.execute("SELECT pg_is_in_recovery()")
+                is_in_recovery = cur.fetchone()[0]
+                status['is_in_recovery'] = is_in_recovery
 
-                if is_publisher:
-                    logging.info(f"Fetching replication slots for {host}")
-                    cur.execute("SELECT slot_name, active, restart_lsn FROM pg_replication_slots")
-                    status['replication_slots'] = cur.fetchall()
+                if not is_in_recovery:
+                    # Physical primary and/or logical publisher
+                    logging.info(f"Host {host} is a primary/publisher")
+                    
+                    # Check for logical publications
+                    cur.execute("SELECT count(*) FROM pg_publication")
+                    is_logical_publisher = cur.fetchone()[0] > 0
+                    status['is_logical_publisher'] = is_logical_publisher
 
-                    logging.info(f"Fetching replication stats for {host}")
-                    cur.execute("SELECT client_addr, state, sent_lsn, write_lsn, flush_lsn, replay_lsn FROM pg_stat_replication")
-                    status['replication_stats'] = cur.fetchall()
+                    if is_logical_publisher:
+                        logging.info(f"Fetching logical replication slots for {host}")
+                        cur.execute("SELECT slot_name, plugin, slot_type, database, active FROM pg_replication_slots WHERE slot_type = 'logical'")
+                        status['logical_replication_slots'] = cur.fetchall()
 
-                    # Compare schema with subscribers
-                    for subscriber in status['replication_stats']:
-                        subscriber_host = subscriber['client_addr']
-                        logging.info(f"Comparing schema between {host} and {subscriber_host}")
-                        subscriber_conn = get_db_connection(subscriber_host)
-                        try:
-                            status['schema_differences'] = compare_schemas(conn, subscriber_conn)
-                        finally:
-                            connection_pools[subscriber_host].putconn(subscriber_conn)
+                        logging.info(f"Fetching logical replication stats for {host}")
+                        cur.execute("SELECT client_addr, state, sent_lsn, write_lsn, flush_lsn, replay_lsn FROM pg_stat_replication WHERE application_name LIKE 'logical%'")
+                        status['logical_replication_stats'] = cur.fetchall()
+
+                    logging.info(f"Fetching physical replication stats for {host}")
+                    cur.execute("SELECT client_addr, state, sent_lsn, write_lsn, flush_lsn, replay_lsn FROM pg_stat_replication WHERE application_name NOT LIKE 'logical%'")
+                    status['physical_replication_stats'] = cur.fetchall()
+
                 else:
-                    logging.info(f"Fetching subscriptions for {host}")
+                    # Physical replica and/or logical subscriber
+                    logging.info(f"Host {host} is a replica/subscriber")
+                    
+                    logging.info(f"Fetching physical replication status for {host}")
+                    cur.execute("SELECT sender_host, sender_port, received_lsn, latest_end_lsn FROM pg_stat_wal_receiver")
+                    status['physical_replication_status'] = cur.fetchone()
+
+                    logging.info(f"Fetching logical subscriptions for {host}")
                     cur.execute("SELECT subname, subenabled, subconninfo FROM pg_subscription")
-                    status['subscriptions'] = cur.fetchall()
+                    status['logical_subscriptions'] = cur.fetchall()
 
                 logging.info(f"Fetching table sync status for {host}")
                 status['table_sync_status'] = get_table_sync_status(conn)
