@@ -88,6 +88,7 @@ connect_to_env() {
     #export $(fbg postgres get-credentials --env "$env" --user "${DB_USER}" "$env")
     psql="/opt/homebrew/opt/postgresql@16/bin/psql"
 
+    echo -ne "\033]0;PG: ${env}\007"
     if [[ "$env" == *"prod"* ]]; then
         $psql --set=PROMPT1="%[%033[1;31m%][${env}] %n@%/%R%#%[%033[0m%] " -d "${DB_NAME}"
     elif [[ "$env" == *"local"* ]]; then

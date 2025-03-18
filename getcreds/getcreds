@@ -1,10 +1,5 @@
 #!/bin/bash
 
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    echo "Error: This script must be sourced. Please run: source $(basename ${0})" >&2
-    exit 1
-fi
-
 # Parse arguments
 usage() {
     cat << EOF
@@ -67,7 +62,7 @@ while IFS= read -r line; do
 done < <(grep -h 'environment_name:' "envs/"* | 
         cut -d':' -f2 | 
         sed 's/^ *//g' |
-        grep -Ev 'data-compute|fbg-local' |
+        grep -Ev 'data-compute' |
         sort)
 
 # Function to connect to the environment
@@ -92,7 +87,7 @@ if [[ -n "${ENV_NAME}" ]]; then
         fi
     done
 
-    # If there is an exact match, connect to it
+    # If there is an exact match, use it
     if [[ -n "$exact_match" ]]; then
         setup_env "$exact_match"
     elif [[ ${#matches[@]} -gt 0 ]]; then

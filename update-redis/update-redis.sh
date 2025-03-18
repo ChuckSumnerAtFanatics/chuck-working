@@ -20,10 +20,10 @@ grep -A1 aws_account_name $DB_PROVISIONER_HOME/envs/${env}-env.yaml | awk '{ pri
         export CLUSTER="$cluster"
         export REGION="$region"
 
-        echo ${cluster}
+        #echo ${cluster}
         for redis in $(aws-vault exec $CLUSTER.AdministratorAccess -- aws elasticache describe-replication-groups --query "ReplicationGroups[*].ReplicationGroupId" --output text --region $REGION | xargs); do
-            echo "  ${redis}"
-            #aws-vault exec $CLUSTER.AdministratorAccess -- aws elasticache batch-apply-update-action --service-update-name elasticache-patch-update-2-202501 --replication-group-ids ${redis} --region $REGION
+            #echo "  ${redis}"
+            echo aws-vault exec $CLUSTER.AdministratorAccess -- aws elasticache batch-apply-update-action --service-update-name elasticache-patch-update-2-202501 --replication-group-ids ${redis} --region $REGION
         done
     fi
 done
