@@ -25,8 +25,19 @@ fi
 
 if [ ! -f "$KUBECONFIG" ]; then
     print_error "Kube config file not found at $KUBECONFIG"
+    clear_terminal_title
     exit 1
 fi
+
+set_terminal_title() {
+    local context="$1"
+    local namespace="$2"
+    echo -ne "\033]0;KK: ${context} -> ${namespace}\007"
+}
+
+clear_terminal_title() {
+    echo -ne "\033]0;\007"
+}
 
 # Function to display menu for context selection
 select_context() {
@@ -49,13 +60,16 @@ select_context() {
     select CONTEXT in "${CONTEXTS[@]}"; do
         if [ "$CONTEXT" = "Exit" ]; then
             print_info "Exiting..."
+            clear_terminal_title
             exit 0
         elif [ -n "$CONTEXT" ]; then
             print_success "Selected context: $CONTEXT"
             if ! kubectl config use-context "$CONTEXT" &> /dev/null; then
                 print_error "Failed to switch to context $CONTEXT"
+                clear_terminal_title
                 exit 1
             fi
+            set_terminal_title "$CONTEXT" "default"
             select_namespace
             break
         else
@@ -86,6 +100,7 @@ select_namespace() {
                 ;;
             "Exit")
                 print_info "Exiting..."
+                clear_terminal_title
                 exit 0
                 ;;
             *)
@@ -93,9 +108,12 @@ select_namespace() {
                     print_success "Selected namespace: $NAMESPACE"
                     if ! kubectl config set-context --current --namespace="$NAMESPACE" &> /dev/null; then
                         print_error "Failed to set namespace $NAMESPACE"
+                        clear_terminal_title
                         exit 1
                     fi
                     
+                    set_terminal_title "$(kubectl config current-context)" "$NAMESPACE"
+
                     print_success "Context and namespace configured successfully!"
                     echo
                     print_info "Current configuration:"
@@ -121,6 +139,7 @@ select_namespace() {
                     select POD in "${PODS[@]}"; do
                         if [ "$POD" = "Exit" ]; then
                             print_info "Exiting..."
+                            clear_terminal_title
                             exit 0
                         elif [ -n "$POD" ]; then
                             print_success "Connecting to pod: $POD"
@@ -131,6 +150,7 @@ select_namespace() {
                                 break
                             else
                                 print_error "Failed to connect to pod $POD - neither /bin/bash nor /bin/sh available"
+                                clear_terminal_title
                                 exit 1
                             fi
                             break
