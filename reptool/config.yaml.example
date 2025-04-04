@@ -1,9 +1,9 @@
 logging:
-  level: ERROR  # Can be DEBUG, INFO, WARNING, ERROR, or CRITICAL
+  level: WARNING  # Can be DEBUG, INFO, WARNING, ERROR, or CRITICAL
 
 output:
   default_format: json
-  report_file: replication_report.json  # Name of the output file for JSON reports
+  json_style: monokai  # Default style for JSON syntax highlighting
 
 monitoring:
   max_workers: 10  # Maximum number of concurrent threads for processing hosts

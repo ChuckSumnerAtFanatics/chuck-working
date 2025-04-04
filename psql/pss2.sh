@@ -1,5 +1,9 @@
 #!/bin/bash
 
+DB_USER="postgres"
+DB_NAME="postgres"
+COLUMNS=$(tput cols)
+
 # Parse arguments
 usage() {
     cat << EOF
@@ -8,18 +12,12 @@ Usage: pss [OPTIONS] [environment]
 Options:
     -d, --database      Database to connect to (default: postgres)
     -h, --help          Show this help message
-    -u, --user USER     Database user (default: postgres)
 
 Arguments:
     environment         Full or partial environment name to connect to
 EOF
     exit 0
 }
-
-# Initialize variables
-DB_USER="postgres"
-DB_NAME="postgres"
-ENV_NAME=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -36,15 +34,6 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             usage
             ;;
-        -u|--user)
-            if [[ -z "$2" ]]; then
-                echo "Error: --user requires an argument" >&2
-                usage
-                exit 1
-            fi
-            DB_USER="$2"
-            shift 2
-            ;;
         -*)
             echo "Unknown option: $1" >&2
             usage
@@ -57,39 +46,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# # Get the current directory
-OHOME=$(pwd)
-
-# Set the terminal width
-COLUMNS=$(tput cols)
-
-# Set this env var to the path of db_provisioner
-if [ -z "${DB_PROVISIONER_HOME}" ]; then
-    echo "Error: DB_PROVISIONER_HOME environment variable must be set" >&2
-    exit 1
-fi
-cd "${DB_PROVISIONER_HOME}"
-
-# Get environment names and build array efficiently
-env_array=($(fbg postgres credentials list --skip-refresh | awk '!/---|Env/ && NF {print $8}' | sort -u))
-# while IFS= read -r line; do
-#     [[ -n "$line" ]] && env_array+=("$line")
-# done < <(grep -h 'environment_name:' "${DB_PROVISIONER_HOME}/envs/"* | 
-#         cut -d':' -f2 | 
-#         sed 's/^ *//g' |
-#         grep -Ev 'data-compute' |
-#         sort)
-
-# Function to connect to the environment
 connect_to_env() {
     local env="$1"
-    echo "Connecting to: $env ${DB_USER}@${DB_NAME}"
-    #export $(poetry run python get_db_creds.py --environment "$env" --user "${DB_USER}")
-    export $(fbg postgres credentials get --skip-refresh --skip-test --env "$env" --user "${DB_USER}" "${env}")
-
+    echo "Connecting to: $env ${DB_USER}@${instance}"
+    export $(fbg postgres credentials get --skip-refresh --skip-test --env "$env" --user "${DB_USER}" "${instance}")
 
     if [[ -n "$ITERM_PROFILE" ]]; then
-        echo -ne "\033]0;PG: ${env}: ${DB_USER}@${DB_NAME}\007"
+        echo -ne "\033]0;PG: ${env}: ${instance}\007"
     fi
     if [[ "$env" == *"prod"* ]]; then
         pgcli --prompt "\x1b[1;31m[${env}] \u@\d>\x1b[0m " -d "${DB_NAME}" -U "${DB_USER}"
@@ -97,23 +60,74 @@ connect_to_env() {
         pgcli --prompt "\x1b[1;36m[${env}] \u@\d>\x1b[0m " -d "${DB_NAME}" -U "${DB_USER}"
     else
         pgcli --prompt "\x1b[1;32m[${env}] \u@\d>\x1b[0m " -d "${DB_NAME}" -U "${DB_USER}"
-        #psql --set=PROMPT1="%[%033[1;32m%][${env}] %n@%/%R%#%[%033[0m%] " -d "${DB_NAME}"
-
     fi
 }
 
+
 # Function to display menu of all environments
 display_menu() {
+
     echo "Select an environment:"
     select env in "${env_array[@]}"; do
         if [[ -n "$env" ]]; then
-            connect_to_env "$env"
+            select_instance "$env"
             break
         else
             echo "Invalid selection. Please try again."
         fi
     done
 }
+
+# Function to select an instance
+select_instance() {
+    local env="$1"
+    instances=()
+    while IFS= read -r line; do
+        instances+=("$line")
+    done < <(echo "$CREDS_LIST" | jq -r --arg env "$env" '.[] | select(.env == $env) | .instance_name' | sort -u)
+
+    echo "Select an instance:"
+    select instance in "${instances[@]}"; do
+        if [[ -n "$instance" ]]; then
+            echo "You selected: $instance"
+            export instance=$instance
+            select_user "$env" "$instance"
+            break
+        else
+            echo "Invalid selection, try again."
+        fi
+    done
+}
+
+select_user() {
+    local env="$1"
+    local instance="$2"
+    users=()
+    while IFS= read -r line; do
+        users+=("$line")
+    done < <(echo "$CREDS_LIST" | jq -r --arg env "$env" --arg instance "$instance" \
+        '.[] | select(.env == $env and .instance_name == $instance) | .username' | sort -u)
+    
+    echo "Select a user:"
+    select user in "${users[@]}"; do
+        if [[ -n "$user" ]]; then
+            echo "You selected: $user"
+            export DB_USER=$user
+            connect_to_env "$env"
+            break
+        else
+            echo "Invalid selection, try again."
+        fi
+    done
+}
+
+# Get credentials list as JSON
+CREDS_LIST=$(fbg postgres credentials list --skip-refresh --output-format json)
+
+env_array=()
+while IFS= read -r line; do
+    [[ -n "$line" ]] && env_array+=("$line")
+done < <(echo "$CREDS_LIST" | jq -r '.[].env' | sort -u)
 
 # Check if environment name is provided
 if [[ -z "${ENV_NAME}" ]]; then
@@ -133,13 +147,13 @@ else
 
     # If there is an exact match, connect to it
     if [[ -n "$exact_match" ]]; then
-        connect_to_env "$exact_match"
+        select_instance "$exact_match"
     elif [[ ${#matches[@]} -gt 0 ]]; then
         # Display menu of matching entries
         echo "Select an environment:"
         select env in "${matches[@]}"; do
             if [[ -n "$env" ]]; then
-                connect_to_env "$env"
+                select_instance "$env"
                 break
             else
                 echo "Invalid selection. Please try again."
@@ -151,8 +165,6 @@ else
     fi
 fi
 
-cd "${OHOME}"
-# clear the iterm title
 if [[ -n "$ITERM_PROFILE" ]]; then
     echo -ne "\033]0;\007"
 fi

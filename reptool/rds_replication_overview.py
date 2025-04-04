@@ -1,3 +1,5 @@
+#! /Users/chuck.sumner/workspace/venvs/pypg/bin/python
+
 import psycopg2
 import json
 from decimal import Decimal
@@ -11,6 +13,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from psycopg2.extras import DictCursor
 from psycopg2.pool import SimpleConnectionPool
 import yaml  # Import the PyYAML library
+from pygments import highlight
+from pygments.lexers import JsonLexer
+from pygments.formatters import Terminal256Formatter
 
 
 def convert_decimal(obj):
@@ -23,30 +28,89 @@ def convert_decimal(obj):
 def assess_replication_health(report: Dict[str, Any]) -> Dict[str, Any]:
     health_status = {
         'overall': 'HEALTHY',
-        'issues': []
+        'issues': [],
+        'recommendations': []
     }
-
-    for link, lag in report['replication_lag'].items():
-        if lag is not None and lag > 1000000:  # More than 1MB behind
-            health_status['issues'].append(f"High replication lag in {link}: {lag} bytes")
-            health_status['overall'] = 'WARNING'
-
+    
+    # Track affected slots by issue type
+    slots_with_lag = []
+    inactive_slots = []
+    
+    # Helper function to get shortened hostname
+    def get_short_hostname(host):
+        if '.' in host:
+            return host.split('.')[0]
+        return host
+    
+    # Check for slot lag issues
     for host, status in report['instance_statuses'].items():
-        if status.get('inactive_replication', {}).get('inactive_slots'):
-            health_status['issues'].append(f"Inactive replication slots on {host}")
-            health_status['overall'] = 'WARNING'
-
-        if status.get('schema_differences'):
-            health_status['issues'].append(f"Schema differences detected on {host}")
-            health_status['overall'] = 'WARNING'
-
-        if 'error' in status:
-            health_status['issues'].append(f"Error on {host}: {status['error']}")
-            health_status['overall'] = 'CRITICAL'
-
-    if len(health_status['issues']) > 5:
-        health_status['overall'] = 'CRITICAL'
-
+        short_host = get_short_hostname(host)
+        for slot_name, slot_info in status.get('replication_slots', {}).items():
+            if slot_info.get('lag_mb', 0) > 100:  # More than 100MB behind
+                health_status['issues'].append(f"Critical replication lag in slot {slot_name} on {short_host}: {slot_info['lag']} ({slot_info['lag_mb']:.2f} MB)")
+                slots_with_lag.append(slot_name)
+                health_status['overall'] = 'CRITICAL'
+            elif slot_info.get('lag_mb', 0) > 10:  # More than 10MB behind
+                health_status['issues'].append(f"High replication lag in slot {slot_name} on {short_host}: {slot_info['lag']} ({slot_info['lag_mb']:.2f} MB)")
+                slots_with_lag.append(slot_name)
+                if health_status['overall'] != 'CRITICAL':
+                    health_status['overall'] = 'WARNING'
+    
+    # Check for WAL generation rate issues
+    high_wal_hosts = []
+    for host, status in report['instance_statuses'].items():
+        short_host = get_short_hostname(host)
+        wal_rate_mb = status.get('wal_generation_rate_mb_per_sec', 0)
+        if wal_rate_mb > 10:  # More than 10MB/s
+            health_status['issues'].append(f"High WAL generation rate on {short_host}: {wal_rate_mb:.2f}MB/s")
+            high_wal_hosts.append(short_host)
+            if health_status['overall'] != 'CRITICAL':
+                health_status['overall'] = 'WARNING'
+    
+    # Check for inactive replication (updated for new format)
+    for host, status in report['instance_statuses'].items():
+        short_host = get_short_hostname(host)
+        inactive_info = status.get('inactive_replication', {})
+        
+        for slot in inactive_info.get('inactive_slots', []):
+            # Check if this is the new format or old format
+            if isinstance(slot, dict):
+                slot_name = slot['name']
+                slot_desc = f"{slot_name} ({slot['retained_wal']} WAL retained)"
+            else:
+                # Handle old format for backward compatibility
+                slot_name = slot[0]
+                slot_desc = slot_name
+                
+            health_status['issues'].append(f"Inactive replication slot {slot_desc} on {short_host}")
+            inactive_slots.append(slot_name)
+            if health_status['overall'] != 'CRITICAL':
+                health_status['overall'] = 'WARNING'
+    
+    # Add consolidated recommendations
+    if slots_with_lag:
+        if len(slots_with_lag) <= 3:
+            for slot in slots_with_lag:
+                health_status['recommendations'].append(f"Check for blocking transactions on subscriber connected to {slot}")
+        else:
+            slot_list = ", ".join(slots_with_lag[:3]) + f" and {len(slots_with_lag) - 3} more"
+            health_status['recommendations'].append(f"Check for blocking transactions on subscribers for slots: {slot_list}")
+    
+    if inactive_slots:
+        if len(inactive_slots) <= 3:
+            for slot in inactive_slots:
+                health_status['recommendations'].append(f"Check if the subscriber connected to {slot} is down or reactivate the slot")
+        else:
+            slot_list = ", ".join(inactive_slots[:3]) + f" and {len(inactive_slots) - 3} more"
+            health_status['recommendations'].append(f"Inactive replication slots detected: {slot_list}")
+            health_status['recommendations'].append("Check if subscribers are down or reactivate slots if needed")
+    
+    if high_wal_hosts:
+        if len(high_wal_hosts) == 1:
+            health_status['recommendations'].append(f"Consider scaling up the subscriber or reducing write load on {high_wal_hosts[0]}")
+        else:
+            health_status['recommendations'].append(f"High WAL generation detected on {len(high_wal_hosts)} hosts - consider scaling up subscribers or reducing write load")
+    
     return health_status
 
 def load_config(config_file='config.yaml'):  # Changed default to config.yaml
@@ -165,100 +229,6 @@ def parse_conninfo(conninfo: str) -> Tuple[Optional[str], Optional[str], Optiona
             password = part.split('=')[1]
     return host, user, password
 
-def get_replication_status(host: str) -> Dict[str, Any]:
-    status = {"replication_slots": {}, "lagging_slots": []}
-    logging.info(f"Getting replication status for host: {host}")
-
-    try:
-        conn = get_db_connection(host)
-        try:
-            with conn.cursor() as cur:
-                # Get LSN for the publisher
-                cur.execute("SELECT pg_current_wal_lsn()")
-                publisher_lsn = cur.fetchone()[0]
-
-                # Get replication slot information
-                cur.execute("""
-                    SELECT slot_name, 
-                        pg_current_wal_lsn() - COALESCE(confirmed_flush_lsn, '0/0') AS lag_bytes, 
-                        confirmed_flush_lsn,
-                        active
-                    FROM pg_replication_slots
-                    WHERE slot_type = 'logical'
-                """)
-                for slot_name, lag_bytes, flush_lsn, active in cur.fetchall():
-                    if isinstance(lag_bytes, Decimal):
-                        lag_bytes = float(lag_bytes)
-
-                    # Convert bytes to MB, rounding to 2 decimal places
-                    lag_mb = round(lag_bytes / 1_048_576, 2)
-
-                    status["replication_slots"][slot_name] = {
-                        "flush_lsn": str(
-                            flush_lsn
-                        ),  # Store as string for JSON compatibility
-                        "lag_mb": lag_mb,  # Display lag in MB
-                        "active": active,
-                    }
-
-                    if lag_mb > 1:  # More than 1MB behind
-                        status["lagging_slots"].append(slot_name)
-
-        finally:
-            connection_pools[host].putconn(conn)
-    except Exception as e:
-        handle_exception(e, f"getting replication status for {host}")
-        status["error"] = str(e)
-
-    return status
-
-def get_table_sync_status(conn: psycopg2.extensions.connection) -> Dict[str, Any]:
-    sync_status = {"mismatched_tables": []}
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT schemaname, relname AS table_name, n_live_tup
-                FROM pg_stat_user_tables
-            """)
-            table_counts = {row[1]: row[2] for row in cur.fetchall()}
-
-            # Compare subscriber table row counts
-            cur.execute("""
-                SELECT schemaname, relname AS table_name, n_live_tup
-                FROM pg_stat_subscription_tables
-            """)
-            for table, sub_count in cur.fetchall():
-                pub_count = table_counts.get(table, None)
-                if pub_count and abs(pub_count - sub_count) > 1000:  # Allow small drift
-                    sync_status["mismatched_tables"].append(
-                        {
-                            "table": table,
-                            "publisher_rows": pub_count,
-                            "subscriber_rows": sub_count,
-                            "difference": abs(pub_count - sub_count),
-                        }
-                    )
-
-    except psycopg2.Error as e:
-        logging.error(f"Error getting table sync status: {e}")
-        sync_status["error"] = str(e)
-
-    return sync_status
-
-def check_inactive_replication(conn: psycopg2.extensions.connection) -> Dict[str, Any]:
-    inactive = {}
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT slot_name, active FROM pg_replication_slots WHERE NOT active")
-            inactive['inactive_slots'] = cur.fetchall()
-
-            cur.execute("SELECT subname, subenabled FROM pg_subscription WHERE NOT subenabled")
-            inactive['disabled_subscriptions'] = cur.fetchall()
-    except psycopg2.Error as e:
-        logging.error(f"Error checking inactive replication: {e}")
-        inactive['error'] = str(e)
-    return inactive
-
 def calculate_replication_lag(
     publisher_lsn: str, subscriber_lsn: Optional[str]
 ) -> Optional[int]:
@@ -270,29 +240,6 @@ def calculate_replication_lag(
         return publisher_lsn - subscriber_lsn
     except ValueError:
         return None
-
-def compare_schemas(conn1: psycopg2.extensions.connection, conn2: psycopg2.extensions.connection) -> List[Tuple[str, str, str]]:
-    differences = []
-    
-    def get_schema(conn):
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT table_name, column_name, data_type
-                FROM information_schema.columns
-                WHERE table_schema = 'public'
-                ORDER BY table_name, ordinal_position
-            """)
-            return cur.fetchall()
-    
-    schema1 = get_schema(conn1)
-    schema2 = get_schema(conn2)
-    
-    if schema1 != schema2:
-        set1 = set(schema1)
-        set2 = set(schema2)
-        differences = list(set1 ^ set2)
-    
-    return differences
 
 def generate_replication_report(topology: Dict[str, List[str]], statuses: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     report = {
@@ -315,8 +262,117 @@ def get_password():
     return os.environ.get('PGPASSWORD') or input("Enter the password: ")
 
 def process_host(host: str, password: str) -> Tuple[str, Dict[str, Any]]:
+    status = {}
+    
     try:
-        status = get_replication_status(host)  # Remove the password argument here
+        # Use a single connection for all operations
+        conn = get_db_connection(host)
+        
+        try:
+            # Get everything with a single connection
+            with conn.cursor() as cur:
+                # 1. Get basic replication status
+                
+                # Get current LSN for the publisher
+                cur.execute("SELECT pg_current_wal_lsn()")
+                publisher_lsn = cur.fetchone()[0]
+                status["current_lsn"] = str(publisher_lsn)
+                
+                # Calculate WAL generation rate
+                cur.execute("SELECT pg_current_wal_lsn() AS start_lsn")
+                start_lsn = cur.fetchone()['start_lsn']
+                
+                cur.execute("SELECT pg_sleep(1)")
+                
+                cur.execute("SELECT pg_current_wal_lsn() AS end_lsn, pg_wal_lsn_diff(pg_current_wal_lsn(), %s) AS diff", 
+                           (start_lsn,))
+                row = cur.fetchone()
+                status["wal_generation_rate_bytes_per_sec"] = row['diff']
+                status["wal_generation_rate_mb_per_sec"] = row['diff'] / (1024 * 1024)
+                
+                # Get replication slot information with enhanced metrics
+                cur.execute("""
+                    SELECT 
+                        rs.slot_name, 
+                        pg_wal_lsn_diff(pg_current_wal_lsn(), rs.confirmed_flush_lsn) as lag_bytes,
+                        rs.confirmed_flush_lsn,
+                        rs.active,
+                        pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), rs.confirmed_flush_lsn)) as lag_pretty,
+                        pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), rs.restart_lsn)) as retained_wal_size,
+                        sr.application_name,
+                        sr.client_addr
+                    FROM pg_replication_slots rs
+                    LEFT JOIN pg_stat_replication sr ON 
+                        rs.slot_name = sr.application_name
+                    WHERE rs.slot_type = 'logical'
+                """)
+
+                slots = cur.fetchall()
+                status["replication_slots"] = {}
+                status["lagging_slots"] = []
+                
+                for slot in slots:
+                    slot_info = dict(slot)
+                    if slot_info.get('lag_bytes') is not None:
+                        slot_info['lag_mb'] = slot_info['lag_bytes'] / (1024 * 1024)
+                        slot_info['lag'] = slot_info['lag_pretty']
+                        slot_info.pop('lag_bytes', None)
+                        slot_info.pop('lag_pretty', None)
+                    status["replication_slots"][slot_info['slot_name']] = slot_info
+                    
+                    if slot_info.get('lag_mb', 0) > 1:
+                        status["lagging_slots"].append(slot_info['slot_name'])
+                
+                # 2. Check inactive replication with better formatting
+                try:
+                    inactive = {
+                        "inactive_slots": [],
+                        "disabled_subscriptions": []
+                    }
+                    
+                    # Get inactive slots with detailed information
+                    cur.execute("""
+                        SELECT 
+                            slot_name, 
+                            slot_type,
+                            pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal
+                        FROM pg_replication_slots 
+                        WHERE NOT active
+                    """)
+                    
+                    for row in cur.fetchall():
+                        inactive['inactive_slots'].append({
+                            "name": row[0],
+                            "type": row[1],
+                            "retained_wal": row[2]
+                        })
+
+                    # Get disabled subscriptions with better format
+                    cur.execute("""
+                        SELECT 
+                            subname, 
+                            subslotname,
+                            suborigin
+                        FROM pg_subscription 
+                        WHERE NOT subenabled
+                    """)
+                    
+                    for row in cur.fetchall():
+                        inactive['disabled_subscriptions'].append({
+                            "name": row[0],
+                            "slot_name": row[1],
+                            "origin": row[2]
+                        })
+                    
+                    status["inactive_replication"] = inactive
+                except Exception as e:
+                    logging.error(f"Error checking inactive replication on {host}: {str(e)}")
+                    status["inactive_replication"] = {"error": str(e)}
+                
+        finally:
+            # Return the single connection we used
+            connection_pools[host].putconn(conn)
+            
         logging.info(f"Successfully processed host: {host}")
         return host, status
     except Exception as e:
@@ -326,11 +382,11 @@ def process_host(host: str, password: str) -> Tuple[str, Dict[str, Any]]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="RDS Replication Overview Tool")
     parser.add_argument("--start-host", help="Starting host for topology discovery (overrides PGHOST)")
-    parser.add_argument("--config", default="config.yaml", help="Path to configuration file")  # Changed default to config.yaml
+    parser.add_argument("--config", default="config.yaml", help="Path to configuration file")
     parser.add_argument("--log-level", choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
                         help="Set the logging level (overrides config file)")
-    parser.add_argument("--output", choices=['json', 'csv'],
-                        help="Output format for the report (overrides config file)")
+    parser.add_argument("--only-lagging", action="store_true", 
+                        help="Only show information about lagging replication slots")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -349,6 +405,17 @@ def main() -> None:
     if not password:
         logging.error("No password provided. Set PGPASSWORD environment variable or enter it when prompted.")
         sys.exit(1)
+
+    # Get the PGHOST value and truncate it at the first '.'
+    pg_host = os.environ.get('PGHOST', 'default_host')
+    if '.' in pg_host:
+        report_name = pg_host.split('.')[0]
+    else:
+        report_name = pg_host  # Use the full value if no '.' is present
+
+    # Use the report_name for replication_report
+    replication_report = f"{report_name}_replication_report"
+    logging.info(f"Replication report name set to: {replication_report}")
 
     try:
         start_user = os.environ.get('PGUSER', 'postgres')
@@ -374,15 +441,34 @@ def main() -> None:
         report = generate_replication_report(topology, statuses)
         report['health_assessment'] = assess_replication_health(report)
 
-        output_format = args.output or config['output']['default_format']
-        if output_format == 'json':
-            print(json.dumps(report, indent=2, default=convert_decimal))
-            with open(config['output']['report_file'], 'w') as f:
-                json.dump(report, f, indent=2, default=convert_decimal)
-        elif output_format == 'csv':
-            logging.warning("CSV output format is not yet implemented")
-        else:
-            logging.warning(f"Unsupported output format: {output_format}")
+        if args.only_lagging:
+            # Filter the report to only show lagging slots
+            for host, status in report["instance_statuses"].items():
+                if "replication_slots" in status:
+                    lagging_slots = {
+                        slot_name: info for slot_name, info in status["replication_slots"].items() 
+                        if info.get("lag_mb", 0) > 1
+                    }
+                    if lagging_slots:
+                        status["replication_slots"] = lagging_slots
+                    else:
+                        status["replication_slots"] = {"message": "No lagging slots detected"}
+
+        # Simplified output handling - always JSON
+        # Generate the JSON string
+        json_str = json.dumps(report, indent=2, default=convert_decimal)
+        
+        # Print colorized JSON to terminal
+        colored_json = highlight(
+            json_str, JsonLexer(), Terminal256Formatter(style="one-dark")
+        )
+        print(colored_json)
+        
+        # Save the regular JSON to file
+        report_filename = f"{replication_report}.json"
+        logging.info(f"Saving report to: {report_filename}")
+        with open(report_filename, 'w') as f:
+            json.dump(report, f, indent=2, default=convert_decimal)
 
     except Exception as e:
         handle_exception(e, "main execution")

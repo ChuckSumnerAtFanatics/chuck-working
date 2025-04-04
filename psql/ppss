@@ -64,14 +64,20 @@ export PGHOST=${primary_host}
 export PGPORT=5432
 
 echo "Connecting to: ${PGUSER}@${DB_NAME} in ${ENV}"
-psql="/opt/homebrew/opt/postgresql@16/bin/psql"
 
-if [[ "${ENV}" == *"prod"* ]]; then
-    $psql --set=PROMPT1="%[%033[1;31m%][${ENV}/${DB_NAME}] %n@%/%R%#%[%033[0m%] " -d "${DB_NAME}"
-elif [[ "${ENV}" == *"local"* ]]; then
-    $psql --set=PROMPT1="%[%033[1;36m%][${ENV}/${DB_NAME}] %n@%/%R%#%[%033[0m%] " -d "${DB_NAME}"
-else
-    $psql --set=PROMPT1="%[%033[1;32m%][${ENV}/${DB_NAME}] %n@%/%R%#%[%033[0m%] " -d "${DB_NAME}"
-fi
+    if [[ -n "$ITERM_PROFILE" ]]; then
+        echo -ne "\033]0;PG: ${ENV}: ${PGHOST}\007"
+    fi
+    if [[ "$env" == *"prod"* ]]; then
+        pgcli --prompt "\x1b[1;31m[${ENV}] \u@\d>\x1b[0m " -d "${DB_NAME}"
+    elif [[ "$env" == *"local"* ]]; then
+        pgcli --prompt "\x1b[1;36m[${ENV}] \u@\d>\x1b[0m " -d "${DB_NAME}"
+    else
+        pgcli --prompt "\x1b[1;32m[${ENV}] \u@\d>\x1b[0m " -d "${DB_NAME}"
+    fi
 
 cd -
+# clear the iterm title
+if [[ -n "$ITERM_PROFILE" ]]; then
+    echo -ne "\033]0;\007"
+fi
