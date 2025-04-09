@@ -63,6 +63,13 @@ export PGPASSWORD=${password}
 export PGHOST=${primary_host}
 export PGPORT=5432
 
+echo "Connection parameters:"
+echo "PGUSER=${username}"
+echo "PGPASSWORD=${password}"
+echo "PGHOST=${primary_host}"
+echo "PGPORT=5432"
+
+
 echo "Connecting to: ${PGUSER}@${DB_NAME} in ${ENV}"
 
     if [[ -n "$ITERM_PROFILE" ]]; then

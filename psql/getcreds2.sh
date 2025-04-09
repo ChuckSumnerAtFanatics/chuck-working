@@ -7,7 +7,7 @@ COLUMNS=$(tput cols)
 # Parse arguments
 usage() {
     cat << EOF
-Usage: pss [OPTIONS] [environment]
+Usage: $0 [OPTIONS] [environment]
 
 Options:
     -d, --database      Database to connect to (default: postgres)
@@ -48,27 +48,13 @@ done
 
 connect_to_env() {
     local env="$1"
-    echo "Connecting to: $env ${DB_USER}@${instance}"
     export $(fbg postgres credentials get --skip-refresh --skip-test --env "$env" --user "${DB_USER}" "${instance}")
 
-    echo "Connection parameters:"
-    echo "export PGUSER=${DB_USER}"
-    echo "export PGPASSWORD=${PGPASSWORD}"  # Show just first 3 chars of password for security
-    echo "export PGHOST=${PGHOST}"
-    echo "export PGPORT=5432"
-
-    if [[ -n "$ITERM_PROFILE" ]]; then
-        echo -ne "\033]0;PG: ${env}: ${instance}\007"
-    fi
-    if [[ "$env" == *"prod"* ]]; then
-        pgcli --prompt "\x1b[1;31m[${env}] \u@\d>\x1b[0m " -d "${DB_NAME}" -U "${DB_USER}"
-    elif [[ "$env" == *"local"* ]]; then
-        pgcli --prompt "\x1b[1;36m[${env}] \u@\d>\x1b[0m " -d "${DB_NAME}" -U "${DB_USER}"
-    else
-        pgcli --prompt "\x1b[1;32m[${env}] \u@\d>\x1b[0m " -d "${DB_NAME}" -U "${DB_USER}"
-    fi
+    echo "PGUSER=${DB_USER}"
+    echo "PGPASSWORD='${PGPASSWORD}'"
+    echo "PGHOST=${PGHOST}"
+    echo "PGPORT=5432"
 }
-
 
 # Function to display menu of all environments
 display_menu() {
@@ -109,12 +95,31 @@ select_user() {
     local env="$1"
     local instance="$2"
     users=()
+    
+    # Get unique usernames from the credentials list
     while IFS= read -r line; do
         users+=("$line")
     done < <(echo "$CREDS_LIST" | jq -r --arg env "$env" --arg instance "$instance" \
         '.[] | select(.env == $env and .instance_name == $instance) | .username' | sort -u)
     
-    echo "Select a user:"
+    # If postgres is in the list, make it the first option
+    postgres_index=-1
+    for i in "${!users[@]}"; do
+        if [[ "${users[$i]}" == "postgres" ]]; then
+            postgres_index=$i
+            break
+        fi
+    done
+    
+    if [[ $postgres_index -ne -1 ]]; then
+        # Remove postgres from its current position
+        postgres_user="${users[$postgres_index]}"
+        unset 'users[$postgres_index]'
+        # Recreate array with postgres first, followed by the rest
+        users=("$postgres_user" "${users[@]}")
+    fi
+    
+    echo "Select a user (default: postgres):"
     select user in "${users[@]}"; do
         if [[ -n "$user" ]]; then
             echo "You selected: $user"
@@ -122,7 +127,10 @@ select_user() {
             connect_to_env "$env"
             break
         else
-            echo "Invalid selection, try again."
+            echo "Invalid selection. Using default: postgres"
+            export DB_USER="postgres"
+            connect_to_env "$env"
+            break
         fi
     done
 }
@@ -159,6 +167,7 @@ else
         echo "Select an environment:"
         select env in "${matches[@]}"; do
             if [[ -n "$env" ]]; then
+                echo "You selected: $env"
                 select_instance "$env"
                 break
             else
@@ -169,8 +178,4 @@ else
         echo "No matching environments found for: ${ENV_NAME}" >&2
         exit 1
     fi
-fi
-
-if [[ -n "$ITERM_PROFILE" ]]; then
-    echo -ne "\033]0;\007"
 fi

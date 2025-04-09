@@ -93,12 +93,15 @@ connect_to_env() {
     fi
     if [[ "$env" == *"prod"* ]]; then
         pgcli --prompt "\x1b[1;31m[${env}] \u@\d>\x1b[0m " -d "${DB_NAME}" -U "${DB_USER}"
+        #psql --set=PROMPT1="%[%033[1;31m%][${env}] %n@%/%R%#%[%033[0m%] " -d "${DB_NAME}"
+
     elif [[ "$env" == *"local"* ]]; then
         pgcli --prompt "\x1b[1;36m[${env}] \u@\d>\x1b[0m " -d "${DB_NAME}" -U "${DB_USER}"
+        #psql --set=PROMPT1="%[%033[1;36m%][${env}] %n@%/%R%#%[%033[0m%] " -d "${DB_NAME}"
+
     else
         pgcli --prompt "\x1b[1;32m[${env}] \u@\d>\x1b[0m " -d "${DB_NAME}" -U "${DB_USER}"
         #psql --set=PROMPT1="%[%033[1;32m%][${env}] %n@%/%R%#%[%033[0m%] " -d "${DB_NAME}"
-
     fi
 }
 

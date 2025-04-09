@@ -29,12 +29,13 @@ def assess_replication_health(report: Dict[str, Any]) -> Dict[str, Any]:
     health_status = {
         'overall': 'HEALTHY',
         'issues': [],
-        'recommendations': []
+        'recommendations': set()  # Using a set to avoid duplicates
     }
     
     # Track affected slots by issue type
     slots_with_lag = []
     inactive_slots = []
+    slot_states = {}  # Track slot states for reporting
     
     # Helper function to get shortened hostname
     def get_short_hostname(host):
@@ -46,13 +47,21 @@ def assess_replication_health(report: Dict[str, Any]) -> Dict[str, Any]:
     for host, status in report['instance_statuses'].items():
         short_host = get_short_hostname(host)
         for slot_name, slot_info in status.get('replication_slots', {}).items():
+            # Track the connection state of each slot
+            if slot_info.get('connection_state'):
+                slot_states[slot_name] = slot_info['connection_state']
+            elif slot_info.get('active') is False:
+                slot_states[slot_name] = 'inactive'
+            else:
+                slot_states[slot_name] = 'unknown'
+                
             if slot_info.get('lag_mb', 0) > 100:  # More than 100MB behind
-                health_status['issues'].append(f"Critical replication lag in slot {slot_name} on {short_host}: {slot_info['lag']} ({slot_info['lag_mb']:.2f} MB)")
-                slots_with_lag.append(slot_name)
+                health_status['issues'].append(f"Critical replication lag in slot {slot_name} on {short_host}: {slot_info['lag']} ({slot_info['lag_mb']:.2f} MB), state: {slot_states[slot_name]}")
+                slots_with_lag.append((slot_name, host))
                 health_status['overall'] = 'CRITICAL'
             elif slot_info.get('lag_mb', 0) > 10:  # More than 10MB behind
-                health_status['issues'].append(f"High replication lag in slot {slot_name} on {short_host}: {slot_info['lag']} ({slot_info['lag_mb']:.2f} MB)")
-                slots_with_lag.append(slot_name)
+                health_status['issues'].append(f"High replication lag in slot {slot_name} on {short_host}: {slot_info['lag']} ({slot_info['lag_mb']:.2f} MB), state: {slot_states[slot_name]}")
+                slots_with_lag.append((slot_name, host))
                 if health_status['overall'] != 'CRITICAL':
                     health_status['overall'] = 'WARNING'
     
@@ -67,13 +76,12 @@ def assess_replication_health(report: Dict[str, Any]) -> Dict[str, Any]:
             if health_status['overall'] != 'CRITICAL':
                 health_status['overall'] = 'WARNING'
     
-    # Check for inactive replication (updated for new format)
+    # Check for inactive replication
     for host, status in report['instance_statuses'].items():
         short_host = get_short_hostname(host)
         inactive_info = status.get('inactive_replication', {})
         
         for slot in inactive_info.get('inactive_slots', []):
-            # Check if this is the new format or old format
             if isinstance(slot, dict):
                 slot_name = slot['name']
                 slot_desc = f"{slot_name} ({slot['retained_wal']} WAL retained)"
@@ -83,34 +91,75 @@ def assess_replication_health(report: Dict[str, Any]) -> Dict[str, Any]:
                 slot_desc = slot_name
                 
             health_status['issues'].append(f"Inactive replication slot {slot_desc} on {short_host}")
-            inactive_slots.append(slot_name)
+            inactive_slots.append((slot_name, host))
             if health_status['overall'] != 'CRITICAL':
                 health_status['overall'] = 'WARNING'
     
-    # Add consolidated recommendations
+    # Add consolidated recommendations with state information (avoiding duplicates)
     if slots_with_lag:
         if len(slots_with_lag) <= 3:
-            for slot in slots_with_lag:
-                health_status['recommendations'].append(f"Check for blocking transactions on subscriber connected to {slot}")
+            for slot_name, host in slots_with_lag:
+                short_host = get_short_hostname(host)
+                state = slot_states.get(slot_name, 'unknown')
+                health_status['recommendations'].add(
+                    f"Check for blocking transactions on subscriber connected to {slot_name} on {short_host} (state: {state})"
+                )
         else:
-            slot_list = ", ".join(slots_with_lag[:3]) + f" and {len(slots_with_lag) - 3} more"
-            health_status['recommendations'].append(f"Check for blocking transactions on subscribers for slots: {slot_list}")
-    
+            # Group lagging slots by state
+            by_state = {}
+            for slot_name, host in slots_with_lag:
+                state = slot_states.get(slot_name, 'unknown')
+                by_state.setdefault(state, []).append(slot_name)
+            
+            for state, slots in by_state.items():
+                slot_list = ", ".join(slots[:3])
+                if len(slots) > 3:
+                    slot_list += f" and {len(slots) - 3} more"
+                health_status['recommendations'].add(
+                    f"Check for blocking transactions on subscribers in {state} state: {slot_list}"
+                )
+            
     if inactive_slots:
         if len(inactive_slots) <= 3:
-            for slot in inactive_slots:
-                health_status['recommendations'].append(f"Check if the subscriber connected to {slot} is down or reactivate the slot")
+            for slot_name, host in inactive_slots:
+                short_host = get_short_hostname(host)
+                health_status['recommendations'].add(
+                    f"Check if the subscriber connected to {slot_name} on {short_host} is down or reactivate the slot"
+                )
         else:
-            slot_list = ", ".join(inactive_slots[:3]) + f" and {len(inactive_slots) - 3} more"
-            health_status['recommendations'].append(f"Inactive replication slots detected: {slot_list}")
-            health_status['recommendations'].append("Check if subscribers are down or reactivate slots if needed")
+            slot_list = ", ".join([name for name, _ in inactive_slots[:3]])
+            if len(inactive_slots) > 3:
+                slot_list += f" and {len(inactive_slots) - 3} more"
+            health_status['recommendations'].add(f"Inactive replication slots detected: {slot_list}")
+            health_status['recommendations'].add("Check if subscribers are down or reactivate slots if needed")
     
-    if high_wal_hosts:
-        if len(high_wal_hosts) == 1:
-            health_status['recommendations'].append(f"Consider scaling up the subscriber or reducing write load on {high_wal_hosts[0]}")
-        else:
-            health_status['recommendations'].append(f"High WAL generation detected on {len(high_wal_hosts)} hosts - consider scaling up subscribers or reducing write load")
+    # Add a summary of slot states if there are any issues
+    if slots_with_lag or inactive_slots:
+        state_counts = {}
+        for state in slot_states.values():
+            state_counts[state] = state_counts.get(state, 0) + 1
+        
+        state_summary = "; ".join([f"{count} slots in '{state}' state" for state, count in sorted(state_counts.items())])
+        health_status['recommendations'].add(f"Connection state summary: {state_summary}")
+        
+        # Add specific recommendations based on connection states (just once per state)
+        state_recommendations = {
+            'startup': "Startup state indicates subscribers are initializing connections. If stuck in this state, check for network connectivity issues.",
+            'catchup': "Catchup state means subscribers are actively catching up with WAL. If persistently lagging, check subscriber server resources.",
+            'streaming': "Streaming is the normal operating state. High lag in this state may indicate insufficient resources on subscribers.",
+            'backup': "Backup state indicates a backup operation is in progress. This may temporarily increase replication lag.",
+            'stopping': "Stopping state means replication is being terminated. Check if this is intentional or if there's an error on subscribers.",
+            'inactive': "Inactive slots are not currently connected. Check if the subscriber service is running and has network connectivity.",
+            'unknown': "Unknown state could indicate connection issues or permission problems. Check subscription status on both ends."
+        }
+        
+        # Add only one recommendation per state that exists in the topology
+        for state in sorted(set(slot_states.values())):
+            if state in state_recommendations:
+                health_status['recommendations'].add(f"For {state} slots: {state_recommendations[state]}")
     
+    # Convert the set back to a list before returning, and sort the recommendations
+    health_status['recommendations'] = sorted(list(health_status['recommendations']))
     return health_status
 
 def load_config(config_file='config.yaml'):  # Changed default to config.yaml
@@ -267,64 +316,105 @@ def process_host(host: str, password: str) -> Tuple[str, Dict[str, Any]]:
     try:
         # Use a single connection for all operations
         conn = get_db_connection(host)
+        conn.autocommit = True  # Use autocommit to avoid transaction block issues
         
         try:
             # Get everything with a single connection
             with conn.cursor() as cur:
                 # 1. Get basic replication status
-                
-                # Get current LSN for the publisher
-                cur.execute("SELECT pg_current_wal_lsn()")
-                publisher_lsn = cur.fetchone()[0]
-                status["current_lsn"] = str(publisher_lsn)
-                
-                # Calculate WAL generation rate
-                cur.execute("SELECT pg_current_wal_lsn() AS start_lsn")
-                start_lsn = cur.fetchone()['start_lsn']
-                
-                cur.execute("SELECT pg_sleep(1)")
-                
-                cur.execute("SELECT pg_current_wal_lsn() AS end_lsn, pg_wal_lsn_diff(pg_current_wal_lsn(), %s) AS diff", 
-                           (start_lsn,))
-                row = cur.fetchone()
-                status["wal_generation_rate_bytes_per_sec"] = row['diff']
-                status["wal_generation_rate_mb_per_sec"] = row['diff'] / (1024 * 1024)
-                
-                # Get replication slot information with enhanced metrics
-                cur.execute("""
-                    SELECT 
-                        rs.slot_name, 
-                        pg_wal_lsn_diff(pg_current_wal_lsn(), rs.confirmed_flush_lsn) as lag_bytes,
-                        rs.confirmed_flush_lsn,
-                        rs.active,
-                        pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), rs.confirmed_flush_lsn)) as lag_pretty,
-                        pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), rs.restart_lsn)) as retained_wal_size,
-                        sr.application_name,
-                        sr.client_addr
-                    FROM pg_replication_slots rs
-                    LEFT JOIN pg_stat_replication sr ON 
-                        rs.slot_name = sr.application_name
-                    WHERE rs.slot_type = 'logical'
-                """)
-
-                slots = cur.fetchall()
-                status["replication_slots"] = {}
-                status["lagging_slots"] = []
-                
-                for slot in slots:
-                    slot_info = dict(slot)
-                    if slot_info.get('lag_bytes') is not None:
-                        slot_info['lag_mb'] = slot_info['lag_bytes'] / (1024 * 1024)
-                        slot_info['lag'] = slot_info['lag_pretty']
-                        slot_info.pop('lag_bytes', None)
-                        slot_info.pop('lag_pretty', None)
-                    status["replication_slots"][slot_info['slot_name']] = slot_info
-                    
-                    if slot_info.get('lag_mb', 0) > 1:
-                        status["lagging_slots"].append(slot_info['slot_name'])
-                
-                # 2. Check inactive replication with better formatting
                 try:
+                    # Get current LSN for the publisher
+                    cur.execute("SELECT pg_current_wal_lsn()")
+                    publisher_lsn = cur.fetchone()[0]
+                    status["current_lsn"] = str(publisher_lsn)
+                except Exception as e:
+                    logging.warning(f"Could not get current LSN for {host}: {e}")
+                    status["current_lsn"] = "unknown"
+                
+                try:
+                    # Calculate WAL generation rate
+                    cur.execute("SELECT pg_current_wal_lsn() AS start_lsn")
+                    start_lsn = cur.fetchone()['start_lsn']
+                    
+                    cur.execute("SELECT pg_sleep(1)")
+                    
+                    cur.execute("SELECT pg_current_wal_lsn() AS end_lsn, pg_wal_lsn_diff(pg_current_wal_lsn(), %s) AS diff", 
+                               (start_lsn,))
+                    row = cur.fetchone()
+                    status["wal_generation_rate_bytes_per_sec"] = row['diff']
+                    status["wal_generation_rate_mb_per_sec"] = row['diff'] / (1024 * 1024)
+                except Exception as e:
+                    logging.warning(f"Could not calculate WAL generation rate for {host}: {e}")
+                    status["wal_generation_rate_bytes_per_sec"] = 0
+                    status["wal_generation_rate_mb_per_sec"] = 0
+                
+                try:
+                    # Get replication slot information with enhanced metrics including owner info
+                    cur.execute("""
+                        SELECT 
+                            rs.slot_name, 
+                            pg_wal_lsn_diff(pg_current_wal_lsn(), rs.confirmed_flush_lsn) as lag_bytes,
+                            rs.confirmed_flush_lsn,
+                            rs.active,
+                            pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), rs.confirmed_flush_lsn)) as lag_pretty,
+                            pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), rs.restart_lsn)) as retained_wal_size,
+                            sr.application_name,
+                            sr.client_addr,
+                            sr.usename as connected_user,
+                            sr.state as connection_state,
+                            rs.plugin
+                        FROM pg_replication_slots rs
+                        LEFT JOIN pg_stat_replication sr ON 
+                            rs.slot_name = sr.application_name
+                        WHERE rs.slot_type = 'logical'
+                    """)
+
+                    slots = cur.fetchall()
+                    status["replication_slots"] = {}
+                    status["lagging_slots"] = []
+                    
+                    for slot in slots:
+                        slot_info = dict(slot)
+                        if slot_info.get('lag_bytes') is not None:
+                            slot_info['lag_mb'] = slot_info['lag_bytes'] / (1024 * 1024)
+                            slot_info['lag'] = slot_info['lag_pretty']
+                            slot_info.pop('lag_bytes', None)
+                            slot_info.pop('lag_pretty', None)
+                        status["replication_slots"][slot_info['slot_name']] = slot_info
+                        
+                        # Rename 'owner' to more accurate 'connected_user'
+                        if 'owner' in slot_info:
+                            slot_info['connected_user'] = slot_info.pop('owner')
+                        
+                        if slot_info.get('lag_mb', 0) > 1:
+                            status["lagging_slots"].append(slot_info['slot_name'])
+                except Exception as e:
+                    logging.warning(f"Could not get replication slot information for {host}: {e}")
+                    status["replication_slots"] = {}
+                    status["lagging_slots"] = []
+                
+                try:
+                    # For slots that don't have an active connection, get owner from subscription
+                    cur.execute("""
+                        SELECT 
+                            sub.subname, 
+                            roles.rolname as owner
+                        FROM pg_subscription sub
+                        JOIN pg_roles roles ON sub.subowner = roles.oid
+                    """)
+                    
+                    sub_owners = {row['subname']: row['owner'] for row in cur.fetchall()}
+                    
+                    # Update slot info with actual owner from subscription
+                    for slot_name, slot_info in status["replication_slots"].items():
+                        if slot_name in sub_owners:
+                            slot_info['owner'] = sub_owners[slot_name]
+                            slot_info['owner_source'] = 'subscription_owner'
+                except Exception as e:
+                    logging.warning(f"Could not get subscription ownership info for {host}: {e}")
+                
+                try:
+                    # 2. Check inactive replication with better formatting
                     inactive = {
                         "inactive_slots": [],
                         "disabled_subscriptions": []
@@ -351,8 +441,7 @@ def process_host(host: str, password: str) -> Tuple[str, Dict[str, Any]]:
                     cur.execute("""
                         SELECT 
                             subname, 
-                            subslotname,
-                            suborigin
+                            subslotname
                         FROM pg_subscription 
                         WHERE NOT subenabled
                     """)
@@ -360,13 +449,12 @@ def process_host(host: str, password: str) -> Tuple[str, Dict[str, Any]]:
                     for row in cur.fetchall():
                         inactive['disabled_subscriptions'].append({
                             "name": row[0],
-                            "slot_name": row[1],
-                            "origin": row[2]
+                            "slot_name": row[1]
                         })
                     
                     status["inactive_replication"] = inactive
                 except Exception as e:
-                    logging.error(f"Error checking inactive replication on {host}: {str(e)}")
+                    logging.warning(f"Error checking inactive replication on {host}: {str(e)}")
                     status["inactive_replication"] = {"error": str(e)}
                 
         finally:
@@ -408,7 +496,7 @@ def main() -> None:
 
     # Get the PGHOST value and truncate it at the first '.'
     pg_host = os.environ.get('PGHOST', 'default_host')
-    if '.' in pg_host:
+    if ('.' in pg_host):
         report_name = pg_host.split('.')[0]
     else:
         report_name = pg_host  # Use the full value if no '.' is present
