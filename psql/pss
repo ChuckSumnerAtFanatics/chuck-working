@@ -9,6 +9,7 @@ Options:
     -d, --database      Database to connect to (default: postgres)
     -h, --help          Show this help message
     -u, --user USER     Database user (default: postgres)
+    -p, --psql          Use psql instead of pgcli
 
 Arguments:
     environment         Full or partial environment name to connect to
@@ -20,6 +21,7 @@ EOF
 DB_USER="postgres"
 DB_NAME="postgres"
 ENV_NAME=""
+USE_PSQL=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -44,6 +46,10 @@ while [[ $# -gt 0 ]]; do
             fi
             DB_USER="$2"
             shift 2
+            ;;
+        -p|--psql)
+            USE_PSQL=true
+            shift
             ;;
         -*)
             echo "Unknown option: $1" >&2
@@ -84,24 +90,31 @@ env_array=($(fbg postgres credentials list --skip-refresh | awk '!/---|Env/ && N
 connect_to_env() {
     local env="$1"
     echo "Connecting to: $env ${DB_USER}@${DB_NAME}"
-    #export $(poetry run python get_db_creds.py --environment "$env" --user "${DB_USER}")
     export $(fbg postgres credentials get --skip-refresh --skip-test --env "$env" --user "${DB_USER}" "${env}")
-
+    env | grep PG
 
     if [[ -n "$ITERM_PROFILE" ]]; then
         echo -ne "\033]0;PG: ${env}: ${DB_USER}@${DB_NAME}\007"
     fi
-    if [[ "$env" == *"prod"* ]]; then
-        pgcli --prompt "\x1b[1;31m[${env}] \u@\d>\x1b[0m " -d "${DB_NAME}" -U "${DB_USER}"
-        #psql --set=PROMPT1="%[%033[1;31m%][${env}] %n@%/%R%#%[%033[0m%] " -d "${DB_NAME}"
-
-    elif [[ "$env" == *"local"* ]]; then
-        pgcli --prompt "\x1b[1;36m[${env}] \u@\d>\x1b[0m " -d "${DB_NAME}" -U "${DB_USER}"
-        #psql --set=PROMPT1="%[%033[1;36m%][${env}] %n@%/%R%#%[%033[0m%] " -d "${DB_NAME}"
-
+    
+    if [[ "$USE_PSQL" == true ]]; then
+        # Use psql with appropriate prompt colors
+        if [[ "$env" == *"prod"* ]]; then
+            psql --set=PROMPT1="%[%033[1;31m%][${env}] %n@%/%R%#%[%033[0m%] "
+        elif [[ "$env" == *"local"* ]]; then
+            psql --set=PROMPT1="%[%033[1;36m%][${env}] %n@%/%R%#%[%033[0m%] "
+        else
+            psql --set=PROMPT1="%[%033[1;32m%][${env}] %n@%/%R%#%[%033[0m%] "
+        fi
     else
-        pgcli --prompt "\x1b[1;32m[${env}] \u@\d>\x1b[0m " -d "${DB_NAME}" -U "${DB_USER}"
-        #psql --set=PROMPT1="%[%033[1;32m%][${env}] %n@%/%R%#%[%033[0m%] " -d "${DB_NAME}"
+        # Use pgcli (default)
+        if [[ "$env" == *"prod"* ]]; then
+            pgcli --prompt "\x1b[1;31m[${env}] \u@\d>\x1b[0m "
+        elif [[ "$env" == *"local"* ]]; then
+            pgcli --prompt "\x1b[1;36m[${env}] \u@\d>\x1b[0m "
+        else
+            pgcli --prompt "\x1b[1;32m[${env}] \u@\d>\x1b[0m "
+        fi
     fi
 }
 

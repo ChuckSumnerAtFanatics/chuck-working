@@ -3,14 +3,18 @@
 DB_USER="postgres"
 DB_NAME="postgres"
 COLUMNS=$(tput cols)
+USE_PSQL=false
+EXPORT_ONLY=false
 
 # Parse arguments
 usage() {
     cat << EOF
-Usage: pss [OPTIONS] [environment]
+Usage: $0 [OPTIONS] [environment]
 
 Options:
     -d, --database      Database to connect to (default: postgres)
+    -p, --psql          Use psql client instead of pgcli
+    -e, --export        Print export commands for credentials and exit
     -h, --help          Show this help message
 
 Arguments:
@@ -31,6 +35,14 @@ while [[ $# -gt 0 ]]; do
             DB_NAME="$2"
             shift 2
             ;;
+        -p|--psql)
+            USE_PSQL=true
+            shift
+            ;;
+        -e|--export)
+            EXPORT_ONLY=true
+            shift
+            ;;
         -h|--help)
             usage
             ;;
@@ -48,27 +60,42 @@ done
 
 connect_to_env() {
     local env="$1"
-    echo "Connecting to: $env ${DB_USER}@${instance}"
+    echo "$env ${DB_USER}@${instance}"
     export $(fbg postgres credentials get --skip-refresh --skip-test --env "$env" --user "${DB_USER}" "${instance}")
 
-    echo "Connection parameters:"
-    echo "export PGUSER=${DB_USER}"
-    echo "export PGPASSWORD=${PGPASSWORD}"  # Show just first 3 chars of password for security
-    echo "export PGHOST=${PGHOST}"
-    echo "export PGPORT=5432"
+    # If export only flag is set, print export commands and exit
+    if [[ "$EXPORT_ONLY" == true ]]; then
+        echo "PGUSER=${DB_USER}"
+        echo "PGPASSWORD=${PGPASSWORD}"
+        echo "PGHOST=${PGHOST}"
+        echo "PGPORT=5432"
+        echo "PGDATABASE=${DB_NAME}"
+        exit 0
+    fi
 
     if [[ -n "$ITERM_PROFILE" ]]; then
         echo -ne "\033]0;PG: ${env}: ${instance}\007"
     fi
-    if [[ "$env" == *"prod"* ]]; then
-        pgcli --prompt "\x1b[1;31m[${env}] \u@\d>\x1b[0m " -d "${DB_NAME}" -U "${DB_USER}"
-    elif [[ "$env" == *"local"* ]]; then
-        pgcli --prompt "\x1b[1;36m[${env}] \u@\d>\x1b[0m " -d "${DB_NAME}" -U "${DB_USER}"
+    
+    if [[ "$USE_PSQL" == true ]]; then
+        # Use psql with appropriate prompt colors
+        if [[ "$env" == *"prod"* ]]; then
+            psql --set=PROMPT1="%[%033[1;31m%][${env}] %n@%/%R%#%[%033[0m%] " -d "${DB_NAME}" -U "${DB_USER}"
+        elif [[ "$env" == *"local"* ]]; then
+            psql --set=PROMPT1="%[%033[1;36m%][${env}] %n@%/%R%#%[%033[0m%] " -d "${DB_NAME}" -U "${DB_USER}"
+        else
+            psql --set=PROMPT1="%[%033[1;32m%][${env}] %n@%/%R%#%[%033[0m%] " -d "${DB_NAME}" -U "${DB_USER}"
+        fi
     else
-        pgcli --prompt "\x1b[1;32m[${env}] \u@\d>\x1b[0m " -d "${DB_NAME}" -U "${DB_USER}"
+        if [[ "$env" == *"prod"* ]]; then
+            pgcli --prompt "\x1b[1;31m[${env}] \u@\d>\x1b[0m " -d "${DB_NAME}" -U "${DB_USER}" -h "${PGHOST}" -p "${PGPORT}"
+        elif [[ "$env" == *"local"* ]]; then
+            pgcli --prompt "\x1b[1;36m[${env}] \u@\d>\x1b[0m " -d "${DB_NAME}" -U "${DB_USER}" -h "${PGHOST}" -p "${PGPORT}"
+        else
+            pgcli --prompt "\x1b[1;32m[${env}] \u@\d>\x1b[0m " -d "${DB_NAME}" -U "${DB_USER}" -h "${PGHOST}" -p "${PGPORT}"
+        fi
     fi
 }
-
 
 # Function to display menu of all environments
 display_menu() {

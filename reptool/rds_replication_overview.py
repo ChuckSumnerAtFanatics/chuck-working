@@ -198,10 +198,12 @@ def get_db_connection(host: str, user: Optional[str] = None, password: Optional[
     return connection_pools[host].getconn()
 
 def discover_replication_topology(
-    start_host: str, start_user: str, start_password: str
+    start_host: str, start_user: str, start_password: str, reuse_connections: bool = True
 ) -> Dict[str, Any]:
     topology = {"links": {}, "logical_publishers": [], "logical_subscribers": []}
     visited = set()
+    link_pairs = set()
+    connection_cache = {}  # Store connections to reuse
 
     def dfs(host: str, user: str, password: str):
         if host in visited:
@@ -210,22 +212,34 @@ def discover_replication_topology(
         logging.info(f"Exploring host: {host}")
 
         try:
-            conn = get_db_connection(host, user, password)
+            # Reuse existing connection if available
+            if reuse_connections and host in connection_cache:
+                conn = connection_cache[host]
+            else:
+                conn = get_db_connection(host, user, password)
+                # Set autocommit to True here to avoid transaction blocks
+                conn.autocommit = True
+                if reuse_connections:
+                    connection_cache[host] = conn
+            
             try:
                 with conn.cursor() as cur:
                     # Get logical subscriptions (subscribers)
                     cur.execute("SELECT subname, subconninfo FROM pg_subscription")
                     subscriptions = cur.fetchall()
 
-                    if subscriptions:
+                    if subscriptions and host not in topology["logical_subscribers"]:
                         topology["logical_subscribers"].append(host)
 
                     for subname, conninfo in subscriptions:
                         pub_host, pub_user, pub_pass = parse_conninfo(conninfo)
                         logging.info(f"{host} subscribes to {pub_host} via {subname}")
 
-                        # Store replication link
-                        topology["links"].setdefault(pub_host, []).append(host)
+                        # Store replication link only if not already recorded
+                        link_pair = (pub_host, host)
+                        if link_pair not in link_pairs:
+                            link_pairs.add(link_pair)
+                            topology["links"].setdefault(pub_host, []).append(host)
 
                         # Recursively explore the publisher
                         dfs(pub_host, pub_user, pub_pass)
@@ -238,33 +252,23 @@ def discover_replication_topology(
                     """)
                     slots = cur.fetchall()
 
-                    if slots:
+                    if slots and host not in topology["logical_publishers"]:
                         logging.info(f"Host {host} is a logical publisher")
                         topology["logical_publishers"].append(host)
 
-                        # Identify its own subscribers
-                        cur.execute("SELECT subname, subconninfo FROM pg_subscription")
-                        new_subscriptions = cur.fetchall()
-
-                        for subname, conninfo in new_subscriptions:
-                            sub_host, sub_user, sub_pass = parse_conninfo(conninfo)
-                            logging.info(
-                                f"{host} also acts as a publisher for {sub_host} via {subname}"
-                            )
-
-                            # Store additional replication link
-                            topology["links"].setdefault(host, []).append(sub_host)
-
-                            # Recursively explore the subscriber (which is also a publisher)
-                            dfs(sub_host, sub_user, sub_pass)
-
             finally:
-                connection_pools[host].putconn(conn)
+                if not reuse_connections:
+                    connection_pools[host].putconn(conn)
+                    
         except psycopg2.Error as e:
             logging.error(f"Error connecting to {host}: {e}")
 
     dfs(start_host, start_user, start_password)
-    return topology
+    
+    # Return both topology and connections for reuse
+    if reuse_connections:
+        return topology, connection_cache
+    return topology, {}
 
 def parse_conninfo(conninfo: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     host = user = password = None
@@ -310,6 +314,138 @@ def generate_replication_report(topology: Dict[str, List[str]], statuses: Dict[s
 def get_password():
     return os.environ.get('PGPASSWORD') or input("Enter the password: ")
 
+def _get_current_lsn(cur, status, host):
+    try:
+        cur.execute("SELECT pg_current_wal_lsn()")
+        publisher_lsn = cur.fetchone()[0]
+        status["current_lsn"] = str(publisher_lsn)
+    except Exception as e:
+        logging.warning(f"Could not get current LSN for {host}: {e}")
+        status["current_lsn"] = "unknown"
+
+def _get_wal_generation_rate(cur, status, host):
+    try:
+        cur.execute("SELECT pg_current_wal_lsn() AS start_lsn")
+        start_lsn = cur.fetchone()['start_lsn']
+        
+        cur.execute("SELECT pg_sleep(1)")
+        
+        cur.execute("SELECT pg_current_wal_lsn() AS end_lsn, pg_wal_lsn_diff(pg_current_wal_lsn(), %s) AS diff", 
+                   (start_lsn,))
+        row = cur.fetchone()
+        status["wal_generation_rate_bytes_per_sec"] = row['diff']
+        status["wal_generation_rate_mb_per_sec"] = row['diff'] / (1024 * 1024)
+    except Exception as e:
+        logging.warning(f"Could not calculate WAL generation rate for {host}: {e}")
+        status["wal_generation_rate_bytes_per_sec"] = 0
+        status["wal_generation_rate_mb_per_sec"] = 0
+
+def _get_replication_slots(cur, status, host):
+    try:
+        cur.execute("""
+            SELECT 
+                rs.slot_name, 
+                pg_wal_lsn_diff(pg_current_wal_lsn(), rs.confirmed_flush_lsn) as lag_bytes,
+                rs.confirmed_flush_lsn,
+                rs.active,
+                pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), rs.confirmed_flush_lsn)) as lag_pretty,
+                pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), rs.restart_lsn)) as retained_wal_size,
+                sr.application_name,
+                sr.client_addr,
+                sr.usename as connected_user,
+                sr.state as connection_state,
+                rs.plugin
+            FROM pg_replication_slots rs
+            LEFT JOIN pg_stat_replication sr ON 
+                rs.slot_name = sr.application_name
+            WHERE rs.slot_type = 'logical'
+        """)
+
+        slots = cur.fetchall()
+        status["replication_slots"] = {}
+        status["lagging_slots"] = []
+        
+        for slot in slots:
+            slot_info = dict(slot)
+            if slot_info.get('lag_bytes') is not None:
+                slot_info['lag_mb'] = slot_info['lag_bytes'] / (1024 * 1024)
+                slot_info['lag'] = slot_info['lag_pretty']
+                slot_info.pop('lag_bytes', None)
+                slot_info.pop('lag_pretty', None)
+            status["replication_slots"][slot_info['slot_name']] = slot_info
+            
+            # Rename 'owner' to more accurate 'connected_user'
+            if 'owner' in slot_info:
+                slot_info['connected_user'] = slot_info.pop('owner')
+            
+            if slot_info.get('lag_mb', 0) > 1:
+                status["lagging_slots"].append(slot_info['slot_name'])
+    except Exception as e:
+        logging.warning(f"Could not get replication slot information for {host}: {e}")
+        status["replication_slots"] = {}
+        status["lagging_slots"] = []
+
+def _get_subscription_ownership(cur, status, host):
+    try:
+        cur.execute("""
+            SELECT 
+                sub.subname, 
+                roles.rolname as owner
+            FROM pg_subscription sub
+            JOIN pg_roles roles ON sub.subowner = roles.oid
+        """)
+        
+        sub_owners = {row['subname']: row['owner'] for row in cur.fetchall()}
+        
+        for slot_name, slot_info in status["replication_slots"].items():
+            if slot_name in sub_owners:
+                slot_info['owner'] = sub_owners[slot_name]
+                slot_info['owner_source'] = 'subscription_owner'
+    except Exception as e:
+        logging.warning(f"Could not get subscription ownership info for {host}: {e}")
+
+def _check_inactive_replication(cur, status, host):
+    try:
+        inactive = {
+            "inactive_slots": [],
+            "disabled_subscriptions": []
+        }
+        
+        cur.execute("""
+            SELECT 
+                slot_name, 
+                slot_type,
+                pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal
+            FROM pg_replication_slots 
+            WHERE NOT active
+        """)
+        
+        for row in cur.fetchall():
+            inactive['inactive_slots'].append({
+                "name": row[0],
+                "type": row[1],
+                "retained_wal": row[2]
+            })
+
+        cur.execute("""
+            SELECT 
+                subname, 
+                subslotname
+            FROM pg_subscription 
+            WHERE NOT subenabled
+        """)
+        
+        for row in cur.fetchall():
+            inactive['disabled_subscriptions'].append({
+                "name": row[0],
+                "slot_name": row[1]
+            })
+        
+        status["inactive_replication"] = inactive
+    except Exception as e:
+        logging.warning(f"Error checking inactive replication on {host}: {str(e)}")
+        status["inactive_replication"] = {"error": str(e)}
+
 def process_host(host: str, password: str) -> Tuple[str, Dict[str, Any]]:
     status = {}
     
@@ -319,152 +455,66 @@ def process_host(host: str, password: str) -> Tuple[str, Dict[str, Any]]:
         conn.autocommit = True  # Use autocommit to avoid transaction block issues
         
         try:
-            # Get everything with a single connection
             with conn.cursor() as cur:
-                # 1. Get basic replication status
-                try:
-                    # Get current LSN for the publisher
-                    cur.execute("SELECT pg_current_wal_lsn()")
-                    publisher_lsn = cur.fetchone()[0]
-                    status["current_lsn"] = str(publisher_lsn)
-                except Exception as e:
-                    logging.warning(f"Could not get current LSN for {host}: {e}")
-                    status["current_lsn"] = "unknown"
-                
-                try:
-                    # Calculate WAL generation rate
-                    cur.execute("SELECT pg_current_wal_lsn() AS start_lsn")
-                    start_lsn = cur.fetchone()['start_lsn']
-                    
-                    cur.execute("SELECT pg_sleep(1)")
-                    
-                    cur.execute("SELECT pg_current_wal_lsn() AS end_lsn, pg_wal_lsn_diff(pg_current_wal_lsn(), %s) AS diff", 
-                               (start_lsn,))
-                    row = cur.fetchone()
-                    status["wal_generation_rate_bytes_per_sec"] = row['diff']
-                    status["wal_generation_rate_mb_per_sec"] = row['diff'] / (1024 * 1024)
-                except Exception as e:
-                    logging.warning(f"Could not calculate WAL generation rate for {host}: {e}")
-                    status["wal_generation_rate_bytes_per_sec"] = 0
-                    status["wal_generation_rate_mb_per_sec"] = 0
-                
-                try:
-                    # Get replication slot information with enhanced metrics including owner info
-                    cur.execute("""
-                        SELECT 
-                            rs.slot_name, 
-                            pg_wal_lsn_diff(pg_current_wal_lsn(), rs.confirmed_flush_lsn) as lag_bytes,
-                            rs.confirmed_flush_lsn,
-                            rs.active,
-                            pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), rs.confirmed_flush_lsn)) as lag_pretty,
-                            pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), rs.restart_lsn)) as retained_wal_size,
-                            sr.application_name,
-                            sr.client_addr,
-                            sr.usename as connected_user,
-                            sr.state as connection_state,
-                            rs.plugin
-                        FROM pg_replication_slots rs
-                        LEFT JOIN pg_stat_replication sr ON 
-                            rs.slot_name = sr.application_name
-                        WHERE rs.slot_type = 'logical'
-                    """)
-
-                    slots = cur.fetchall()
-                    status["replication_slots"] = {}
-                    status["lagging_slots"] = []
-                    
-                    for slot in slots:
-                        slot_info = dict(slot)
-                        if slot_info.get('lag_bytes') is not None:
-                            slot_info['lag_mb'] = slot_info['lag_bytes'] / (1024 * 1024)
-                            slot_info['lag'] = slot_info['lag_pretty']
-                            slot_info.pop('lag_bytes', None)
-                            slot_info.pop('lag_pretty', None)
-                        status["replication_slots"][slot_info['slot_name']] = slot_info
-                        
-                        # Rename 'owner' to more accurate 'connected_user'
-                        if 'owner' in slot_info:
-                            slot_info['connected_user'] = slot_info.pop('owner')
-                        
-                        if slot_info.get('lag_mb', 0) > 1:
-                            status["lagging_slots"].append(slot_info['slot_name'])
-                except Exception as e:
-                    logging.warning(f"Could not get replication slot information for {host}: {e}")
-                    status["replication_slots"] = {}
-                    status["lagging_slots"] = []
-                
-                try:
-                    # For slots that don't have an active connection, get owner from subscription
-                    cur.execute("""
-                        SELECT 
-                            sub.subname, 
-                            roles.rolname as owner
-                        FROM pg_subscription sub
-                        JOIN pg_roles roles ON sub.subowner = roles.oid
-                    """)
-                    
-                    sub_owners = {row['subname']: row['owner'] for row in cur.fetchall()}
-                    
-                    # Update slot info with actual owner from subscription
-                    for slot_name, slot_info in status["replication_slots"].items():
-                        if slot_name in sub_owners:
-                            slot_info['owner'] = sub_owners[slot_name]
-                            slot_info['owner_source'] = 'subscription_owner'
-                except Exception as e:
-                    logging.warning(f"Could not get subscription ownership info for {host}: {e}")
-                
-                try:
-                    # 2. Check inactive replication with better formatting
-                    inactive = {
-                        "inactive_slots": [],
-                        "disabled_subscriptions": []
-                    }
-                    
-                    # Get inactive slots with detailed information
-                    cur.execute("""
-                        SELECT 
-                            slot_name, 
-                            slot_type,
-                            pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal
-                        FROM pg_replication_slots 
-                        WHERE NOT active
-                    """)
-                    
-                    for row in cur.fetchall():
-                        inactive['inactive_slots'].append({
-                            "name": row[0],
-                            "type": row[1],
-                            "retained_wal": row[2]
-                        })
-
-                    # Get disabled subscriptions with better format
-                    cur.execute("""
-                        SELECT 
-                            subname, 
-                            subslotname
-                        FROM pg_subscription 
-                        WHERE NOT subenabled
-                    """)
-                    
-                    for row in cur.fetchall():
-                        inactive['disabled_subscriptions'].append({
-                            "name": row[0],
-                            "slot_name": row[1]
-                        })
-                    
-                    status["inactive_replication"] = inactive
-                except Exception as e:
-                    logging.warning(f"Error checking inactive replication on {host}: {str(e)}")
-                    status["inactive_replication"] = {"error": str(e)}
+                # Add consistent error handling for each database operation
+                for query_func in [
+                    _get_current_lsn,
+                    _get_wal_generation_rate,
+                    _get_replication_slots,
+                    _get_subscription_ownership,
+                    _check_inactive_replication
+                ]:
+                    try:
+                        query_func(cur, status, host)
+                    except psycopg2.Error as e:
+                        logging.warning(f"Error in {query_func.__name__} for {host}: {e}")
+                        # Each function should have reasonable defaults for failure cases
                 
         finally:
-            # Return the single connection we used
             connection_pools[host].putconn(conn)
             
         logging.info(f"Successfully processed host: {host}")
         return host, status
     except Exception as e:
         logging.error(f"Error processing host {host}: {str(e)}")
+        return host, {"error": str(e)}
+
+def process_host_with_conn(host: str, conn) -> Tuple[str, Dict[str, Any]]:
+    """Process a host using an existing database connection."""
+    status = {}
+    
+    try:
+        # Don't set autocommit here; it should be set when connection is first created
+        # Instead, make sure we're outside any transaction
+        if conn.status != psycopg2.extensions.STATUS_READY:
+            # If we're in a transaction, roll it back to get to a clean state
+            conn.rollback()
+        
+        with conn.cursor() as cur:
+            # Process all queries with the existing connection
+            for query_func in [
+                _get_current_lsn,
+                _get_wal_generation_rate,
+                _get_replication_slots,
+                _get_subscription_ownership,
+                _check_inactive_replication
+            ]:
+                try:
+                    query_func(cur, status, host)
+                except psycopg2.Error as e:
+                    logging.warning(f"Error in {query_func.__name__} for {host}: {e}")
+                    # If an error occurred, try to rollback to get back to a clean state
+                    conn.rollback()
+                    
+        logging.info(f"Successfully processed host: {host}")
+        return host, status
+    except Exception as e:
+        logging.error(f"Error processing host {host}: {str(e)}")
+        # Try to rollback in case of error
+        try:
+            conn.rollback()
+        except:
+            pass
         return host, {"error": str(e)}
 
 def main() -> None:
@@ -513,14 +563,24 @@ def main() -> None:
             sys.exit(1)
 
         logging.info("Discovering replication topology...")
-        topology = discover_replication_topology(start_host, start_user, password)
+        topology, connection_cache = discover_replication_topology(start_host, start_user, password, True)
         logging.info("Topology discovery completed")
-        logging.debug(f"Discovered topology: {json.dumps(topology, indent=2)}")
 
-        max_workers = config['monitoring']['max_workers']
+        max_workers = config['monitoring'].get('max_workers', 10)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_host = {executor.submit(process_host, host, password): host 
-                              for host in topology['logical_publishers'] + topology['logical_subscribers']}
+            future_to_host = {}
+            hosts_to_process = topology['logical_publishers'] + topology['logical_subscribers']
+            
+            # Use cached connections where available
+            for host in hosts_to_process:
+                if host in connection_cache:
+                    # Reuse existing connection
+                    future = executor.submit(process_host_with_conn, host, connection_cache[host])
+                else:
+                    # Create new connection
+                    future = executor.submit(process_host, host, password)
+                future_to_host[future] = host
+                
             statuses = {}
             for future in as_completed(future_to_host):
                 host, status = future.result()
