@@ -6,7 +6,7 @@
 # 17.x -> 17.3
 
 # what env?
-env="cert"
+env="prod"
 
 export AWS_PAGER=""
 
@@ -29,8 +29,12 @@ grep -A1 aws_account_name $DB_PROVISIONER_HOME/envs/${env}-env.yaml | awk '{ pri
 
         echo ${cluster}
         for rds in $(aws-vault exec $CLUSTER.AdministratorAccess -- aws rds describe-db-instances --region ${REGION} | jq -r '.DBInstances[].DBInstanceIdentifier'); do
-          for instance in $(aws-vault exec $CLUSTER.AdministratorAccess -- aws rds describe-db-instances --db-instance-identifier ${rds} --region ${REGION} | jq -r '.DBInstances[] | select(.EngineVersion | startswith("13.")) | .DBInstanceIdentifier'); do
-            aws-vault exec $CLUSTER.AdministratorAccess -- aws rds describe-db-instances --db-instance-identifier ${instance} --region ${REGION} | jq -r '.DBInstances[] | "  \(.DBInstanceIdentifier): \(.EngineVersion)"'
+for instance in $(aws-vault exec $CLUSTER.AdministratorAccess -- aws rds describe-db-instances --db-instance-identifier ${rds} --region ${REGION} | jq -r '.DBInstances[] | select(.EngineVersion and (.DBInstanceClass | startswith("db.t4g."))) | .DBInstanceIdentifier'); do
+          #for instance in $(aws-vault exec $CLUSTER.AdministratorAccess -- aws rds describe-db-instances --db-instance-identifier ${rds} --region ${REGION} | jq -r '.DBInstances[] | select(.EngineVersion) | .DBInstanceIdentifier'); do
+          #for instance in $(aws-vault exec $CLUSTER.AdministratorAccess -- aws rds describe-db-instances --db-instance-identifier ${rds} --region ${REGION} | jq -r '.DBInstances[] | select(.EngineVersion | startswith("13.")) | .DBInstanceIdentifier'); do
+            #aws-vault exec $CLUSTER.AdministratorAccess -- aws rds describe-db-instances --db-instance-identifier ${instance} --region ${REGION} | jq -r '.DBInstances[] | "  \(.DBInstanceIdentifier): \(.EngineVersion)"'
+            aws-vault exec $CLUSTER.AdministratorAccess -- aws rds describe-db-instances --db-instance-identifier ${instance} --region ${REGION} | jq -r '.DBInstances[] | "  \(.DBInstanceIdentifier): \(.EngineVersion) [\(.DBInstanceClass)]"'
+            
           done
         done
 

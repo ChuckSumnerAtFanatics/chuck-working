@@ -1,62 +1,7 @@
 #!/bin/bash
 
-DB_USER="postgres"
-DB_NAME="postgres"
-COLUMNS=$(tput cols)
-USE_PSQL=false
-EXPORT_ONLY=false
-
-# Parse arguments
-usage() {
-    cat << EOF
-Usage: $0 [OPTIONS] [environment]
-
-Options:
-    -d, --database      Database to connect to (default: postgres)
-    -p, --psql          Use psql client instead of pgcli
-    -e, --export        Print export commands for credentials and exit
-    -h, --help          Show this help message
-
-Arguments:
-    environment         Full or partial environment name to connect to
-EOF
-    exit 0
-}
-
-# Parse arguments
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -d|--database)
-            if [[ -z "$2" ]]; then
-                echo "Error: --database requires an argument" >&2
-                usage
-                exit 1
-            fi
-            DB_NAME="$2"
-            shift 2
-            ;;
-        -p|--psql)
-            USE_PSQL=true
-            shift
-            ;;
-        -e|--export)
-            EXPORT_ONLY=true
-            shift
-            ;;
-        -h|--help)
-            usage
-            ;;
-        -*)
-            echo "Unknown option: $1" >&2
-            usage
-            exit 1
-            ;;
-        *)
-            ENV_NAME="$1"
-            shift
-            ;;
-    esac
-done
+# Load functions
+source pss2_functions.sh
 
 connect_to_env() {
     local env="$1"
@@ -97,62 +42,84 @@ connect_to_env() {
     fi
 }
 
-# Function to display menu of all environments
-display_menu() {
+DB_USER="postgres"
+DB_NAME="postgres"
+COLUMNS=$(tput cols)
+USE_PSQL=false
+EXPORT_ONLY=false
+SELECT_USER=false
 
-    echo "Select an environment:"
-    select env in "${env_array[@]}"; do
-        if [[ -n "$env" ]]; then
-            select_instance "$env"
-            break
-        else
-            echo "Invalid selection. Please try again."
-        fi
-    done
+# Parse arguments
+usage() {
+    cat << EOF
+Usage: $0 [OPTIONS] [environment]
+
+Options:
+    -d, --database      Database to connect to (default: postgres)
+    -p, --psql          Use psql client instead of pgcli
+    -e, --export        Print export commands for credentials and exit
+    -u, --user          Show user selection dialog (default: use postgres user)
+    -h, --help          Show this help message
+
+Arguments:
+    environment         Full or partial environment name to connect to
+EOF
+    exit 0
 }
 
-# Function to select an instance
-select_instance() {
-    local env="$1"
-    instances=()
-    while IFS= read -r line; do
-        instances+=("$line")
-    done < <(echo "$CREDS_LIST" | jq -r --arg env "$env" '.[] | select(.env == $env) | .instance_name' | sort -u)
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d|--database)
+            if [[ -z "$2" ]]; then
+                echo "Error: --database requires an argument" >&2
+                usage
+                exit 1
+            fi
+            DB_NAME="$2"
+            shift 2
+            ;;
+        -p|--psql)
+            USE_PSQL=true
+            shift
+            ;;
+        -e|--export)
+            EXPORT_ONLY=true
+            shift
+            ;;
+        -u|--user)
+            SELECT_USER=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            usage
+            exit 1
+            ;;
+        *)
+            ENV_NAME="$1"
+            shift
+            ;;
+    esac
+done
 
-    echo "Select an instance:"
-    select instance in "${instances[@]}"; do
-        if [[ -n "$instance" ]]; then
-            echo "You selected: $instance"
-            export instance=$instance
-            select_user "$env" "$instance"
-            break
-        else
-            echo "Invalid selection, try again."
-        fi
-    done
-}
 
-select_user() {
-    local env="$1"
-    local instance="$2"
-    users=()
-    while IFS= read -r line; do
-        users+=("$line")
-    done < <(echo "$CREDS_LIST" | jq -r --arg env "$env" --arg instance "$instance" \
-        '.[] | select(.env == $env and .instance_name == $instance) | .username' | sort -u)
-    
-    echo "Select a user:"
-    select user in "${users[@]}"; do
-        if [[ -n "$user" ]]; then
-            echo "You selected: $user"
-            export DB_USER=$user
-            connect_to_env "$env"
-            break
-        else
-            echo "Invalid selection, try again."
-        fi
-    done
-}
+    # If export only flag is set, print export commands and exit
+    if [[ "$EXPORT_ONLY" == true ]]; then
+        echo "PGUSER=${DB_USER}"
+        echo "PGPASSWORD=${PGPASSWORD}"
+        echo "PGHOST=${PGHOST}"
+        echo "PGPORT=5432"
+        echo "PGDATABASE=${DB_NAME}"
+        exit 0
+    fi
+
+    if [[ -n "$ITERM_PROFILE" ]]; then
+        echo -ne "\033]0;PG: ${env}: ${instance}\007"
+    fi
 
 # Get credentials list as JSON
 CREDS_LIST=$(fbg postgres credentials list --skip-refresh --output-format json)
@@ -170,7 +137,7 @@ else
     exact_match=""
 
     for env in "${env_array[@]}"; do
-        if [[ "$env" == "${ENV_NAME}" ]]; then
+        if ([[ "$env" == "${ENV_NAME}" ]]); then
             exact_match="$env"
             break
         elif [[ "$env" == *"${ENV_NAME}"* ]]; then

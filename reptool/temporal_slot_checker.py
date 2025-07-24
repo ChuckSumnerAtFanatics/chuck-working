@@ -1,4 +1,4 @@
-#! /Users/chuck.sumner/workspace/venvs/pypg/bin/python
+#!/usr/bin/env python3
 
 import os
 import re
@@ -6,194 +6,355 @@ import psycopg2
 from psycopg2 import OperationalError
 from psycopg2.extras import RealDictCursor
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional, List, Tuple
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# --- Logging Setup ---
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
+# --- Global Summary Storage ---
+SUMMARY = []
 
-def parse_conninfo(conninfo):
-    """Parse a PostgreSQL connection string into its components."""
-    params = {}
-    for part in conninfo.split():
-        key, value = part.split("=", 1)
-        params[key] = value
-    return params
+# --- Helper Functions ---
 
 
-def fetch_subscriber_slots(subscriber_conn):
-    """Fetch temporal slots from a subscriber."""
-    with subscriber_conn.cursor(cursor_factory=RealDictCursor) as cur:
+def get_required_env_variable(var_name: str) -> str:
+    value = os.getenv(var_name)
+    if value is None:
+        raise ValueError(f"Required environment variable {var_name} is not set.")
+    return value
+
+
+def get_env_variable(var_name: str, default: Optional[str] = None) -> Optional[str]:
+    return os.getenv(var_name, default)
+
+
+def connect_db(
+    conn_params: Dict[str, Any], connection_desc: str, sub_oid: Optional[int] = None
+) -> Optional[psycopg2.extensions.connection]:
+    safe_params = {
+        k: ("*****" if k == "password" else v) for k, v in conn_params.items()
+    }
+    logger.info(f"Connecting to {connection_desc} with parameters: {safe_params}")
+    logger.debug(f"Raw connection parameters: {conn_params}")
+
+    if not conn_params.get("password") and sub_oid:
+        env_var_name = f"SUB_PASSWORD_{sub_oid}"
+        dynamic_password = os.getenv(env_var_name)
+        if dynamic_password:
+            conn_params["password"] = dynamic_password
+            logger.info(
+                f"  [✓] Retrieved password for subscription OID {sub_oid} from env var {env_var_name}"
+            )
+        else:
+            logger.warning(
+                f"  [!] No dynamic password found for subscription OID {sub_oid}"
+            )
+
+    try:
+        conn = psycopg2.connect(**conn_params)
+        logger.info(f"Successfully connected to {connection_desc}")
+        return conn
+    except OperationalError as e:
+        logger.error(f"Failed to connect to {connection_desc}: {e}")
+        logger.error(f"  [!] Connection parameters used: {conn_params}")
+        logger.info(f"Retrying connection to {connection_desc} after 2 seconds...")
+        import time
+        time.sleep(2)
+        try:
+            conn = psycopg2.connect(**conn_params)
+            logger.info(f"Successfully connected to {connection_desc} on retry")
+            return conn
+        except Exception as e2:
+            logger.error(f"Retry failed: {e2}")
+            return None
+    except Exception as e:
+        logger.error(f"Unexpected error connecting to {connection_desc}: {e}")
+        return None
+
+
+def gather_temporal_replication_slots(
+    conn: psycopg2.extensions.connection,
+) -> List[Dict[str, Any]]:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("""
-            SELECT slot_name
+            SELECT slot_name, plugin, active, active_pid, database
             FROM pg_replication_slots
-            WHERE slot_name ~ '^pg_\\d+_sync_\\d+_\\d+$'
+            WHERE plugin = 'pgoutput'
         """)
         return cur.fetchall()
 
 
-def fetch_publisher_slots(conn):
-    """Fetch temporal slots from the publisher."""
+def gather_active_subscribers(
+    conn: psycopg2.extensions.connection,
+) -> List[Dict[str, Any]]:
+    """Get active subscriber connections from pg_stat_replication."""
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("""
-            SELECT slot_name
-            FROM pg_replication_slots
-            WHERE slot_name ~ '^pg_\\d+_sync_\\d+_\\d+$'
+            SELECT
+                pid,
+                application_name,
+                client_addr,
+                client_hostname
+            FROM
+                pg_stat_replication
         """)
         return cur.fetchall()
 
 
-def decode_temporal_slots(conn):
-    # Fetch temporal slots from the publisher
-    slots = fetch_publisher_slots(conn)
-    print(f"Fetched slots from publisher: {[slot['slot_name'] for slot in slots]}")
-
-    # Dictionary to track results
-    results = {}
-
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        # Fetch subscriber connection info
-        cur.execute("""
-            SELECT subname, subconninfo
-            FROM pg_subscription
-        """)
-        subscriptions = cur.fetchall()
-
-        for subscription in subscriptions:
-            subname = subscription["subname"]
-            conninfo = subscription["subconninfo"]
-            subscriber_params = parse_conninfo(conninfo)
-
-            # Print the name and host of the subscriber being checked
-            subscriber_host = subscriber_params.get("host", "unknown")
-            print(f"Checking subscriber: {subname} (host: {subscriber_host})")
-
-            # Connect to the subscriber
-            try:
-                with psycopg2.connect(
-                    dbname=subscriber_params.get("dbname", "postgres"),
-                    user=subscriber_params.get("user", "postgres"),
-                    password=subscriber_params.get("password"),
-                    host=subscriber_host,
-                    port=int(subscriber_params.get("port", 5432)),
-                ) as subscriber_conn:
-                    for slot in slots:
-                        slot_name = slot["slot_name"]
-                        print(f"\nProcessing slot: {slot_name}")
-                        match = re.match(r"^pg_(\d+)_sync_(\d+)_\d+$", slot_name)
-                        if not match:
-                            print(f"  [!] Slot {slot_name} does not match the expected regex pattern.")
-                            continue
-
-                        sub_oid, rel_oid = int(match.group(1)), int(match.group(2))
-                        print(f"  Extracted OIDs → Subscription OID: {sub_oid}, Table OID: {rel_oid}")
-
-                        # Initialize tracking for this slot
-                        if slot_name not in results:
-                            results[slot_name] = {
-                                "sub_oid_found": False,
-                                "rel_oid_found": False,
-                                "subscribers": [],
-                            }
-
-                        # Check if the subscription OID exists on the subscriber
-                        subscription = check_subscription_oid(subscriber_conn, sub_oid)
-                        if subscription:
-                            print(f"  [✓] Found subscription OID {sub_oid} on subscriber.")
-                            results[slot_name]["sub_oid_found"] = True
-                            results[slot_name]["subscribers"].append(
-                                f"Subscription OID {sub_oid} found on {subname}"
-                            )
-                        else:
-                            print(f"  [!] Subscription OID {sub_oid} not found on subscriber.")
-
-                        # Lookup table on the subscriber
-                        table = check_table_oid(subscriber_conn, rel_oid)
-                        if table:
-                            schema, relname = table["nspname"], table["relname"]
-                            print(f"  [✓] Found table: {schema}.{relname}")
-                            results[slot_name]["rel_oid_found"] = True
-                            results[slot_name]["subscribers"].append(
-                                f"Table OID {rel_oid} ({schema}.{relname}) found on {subname}"
-                            )
-                        else:
-                            print(f"  [!] Table with OID {rel_oid} not found on subscriber.")
-            except OperationalError as e:
-                print(f"Database connection failed for subscriber {subname}: {e}")
-            except Exception as e:
-                print(f"An unexpected error occurred: {e}")
-
-    print_summary(results)
+def get_subscription_name_from_oid(conn, sub_oid) -> Optional[str]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT subname FROM pg_subscription WHERE oid = %s", (sub_oid,))
+        result = cur.fetchone()
+        return result[0] if result else None
 
 
-def print_summary(results: Dict[str, Any]):
-    print("\nSummary:")
-    for slot_name, result in results.items():
-        print(f"\nSlot: {slot_name}")
-        if result["sub_oid_found"]:
-            print("  [✓] Subscription OID found:")
-            for location in result["subscribers"]:
-                if "Subscription OID" in location:
-                    print(f"    - {location}")
-        else:
-            print("  [!] Subscription OID not found on any subscriber.")
-
-        if result["rel_oid_found"]:
-            print("  [✓] Table OID found:")
-            for location in result["subscribers"]:
-                if "Table OID" in location:
-                    print(f"    - {location}")
-        else:
-            print("  [!] Table OID not found on any subscriber.")
-
-
-def check_subscription_oid(subscriber_conn, sub_oid):
-    """Check if the subscription OID exists on the subscriber."""
-    with subscriber_conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("""
-            SELECT subname
-            FROM pg_subscription
-            WHERE oid = %s
-        """, (sub_oid,))
-        return cur.fetchone()
-
-
-def check_table_oid(subscriber_conn, rel_oid):
-    """Check if the table OID exists on the subscriber."""
-    with subscriber_conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("""
+def get_table_details_from_oid(conn, rel_oid) -> Optional[Tuple[str, str]]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
             SELECT n.nspname, c.relname
             FROM pg_class c
             JOIN pg_namespace n ON n.oid = c.relnamespace
             WHERE c.oid = %s
-        """, (rel_oid,))
-        return cur.fetchone()
+        """,
+            (rel_oid,),
+        )
+        result = cur.fetchone()
+        return (result[0], result[1]) if result else None
 
 
-def get_env_variable(var_name, default=None):
-    value = os.getenv(var_name, default)
-    if value is None:
-        raise ValueError(f"Environment variable {var_name} is not set.")
-    return value
+def get_subscription_connection_info(conn, sub_oid):
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT subconninfo FROM pg_subscription WHERE oid = %s", (sub_oid,)
+        )
+        result = cur.fetchone()
+        return result["subconninfo"] if result else None
+
+
+def parse_conninfo(conninfo: str) -> Dict[str, str]:
+    params = {}
+    if conninfo:
+        for part in conninfo.split():
+            if "=" in part:
+                key, value = part.split("=", 1)
+                params[key] = value
+    if "password" not in params:
+        params["password"] = None
+    return params
+
+
+# --- Core Logic ---
+
+
+def analyze_publisher_slots(conn):
+    logger.info("Gathering temporal replication slots...")
+    temporal_slots = gather_temporal_replication_slots(conn)
+
+    if not temporal_slots:
+        logger.info("No temporal replication slots found.")
+        return
+
+    logger.info(
+        f"Found {len(temporal_slots)} temporal slots. Gathering active subscribers..."
+    )
+    active_subscribers = gather_active_subscribers(conn)
+    slot_active_pids = {sub["pid"] for sub in active_subscribers}
+    logger.info(f"Found {len(active_subscribers)} active subscriber connections.")
+
+    for slot in temporal_slots:
+        slot_name = slot["slot_name"]
+        db_name = slot.get("database", "N/A")
+        active_pid = slot.get("active_pid")
+
+        logger.info(f"\n--- Analyzing Slot: '{slot_name}' (DB: {db_name}) ---")
+
+        manually_connect_if_no_pid = False
+        if not active_pid or active_pid not in slot_active_pids:
+            logger.warning(
+                f"  [!] No active subscriber process found for slot {slot_name}. Attempting manual subscriber connection..."
+            )
+            manually_connect_if_no_pid = True
+
+        match = re.match(r"^pg_(\d+)_sync_(\d+)_\d+$", slot_name)
+
+        if match:
+            # TEMPORAL SLOT
+            sub_oid = int(match.group(1))
+            rel_oid = int(match.group(2))
+            slot_type = "TEMPORAL"
+
+            sub_name = get_subscription_name_from_oid(conn, sub_oid)
+            if not sub_name:
+                logger.warning(
+                    f"  [!] Could not find subscription for slot {slot_name}. Skipping."
+                )
+                continue
+
+            table_details = get_table_details_from_oid(conn, rel_oid)
+            if not table_details:
+                logger.warning(
+                    f"  [!] Could not find table for slot {slot_name}. Skipping."
+                )
+                continue
+            schema, table_name = table_details
+
+        else:
+            # REGULAR SLOT
+            slot_type = "REGULAR"
+            sub_name = slot_name  # Assume default 1:1 mapping
+            schema = "N/A"
+            table_name = "N/A"
+
+        # Get subconninfo (you need sub_oid only for temporal, but you can fake it if needed)
+        if match:
+            conninfo = get_subscription_connection_info(conn, sub_oid)
+        else:
+            # Lookup subconninfo by subscription name
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT subconninfo FROM pg_subscription WHERE subname = %s",
+                    (sub_name,),
+                )
+                result = cur.fetchone()
+                if result:
+                    conninfo = result["subconninfo"]
+                else:
+                    conninfo = None
+
+        if not conninfo:
+            logger.warning(
+                f"  [!] Missing connection info for subscription {sub_name}. Skipping."
+            )
+            continue
+
+        conn_params = parse_conninfo(conninfo)
+
+        subscriber_conn = connect_db(
+            {
+                "host": conn_params.get("host"),
+                "port": int(conn_params.get("port", "5432")),
+                "dbname": conn_params.get("dbname"),
+                "user": conn_params.get("user"),
+                "password": conn_params.get("password"),
+            },
+            f"Subscriber {conn_params.get('host', 'unknown')}",
+            sub_oid=sub_oid if match else None,
+        )
+
+        if subscriber_conn:
+            logger.info(
+                f"  [✓] Connected to subscriber: {conn_params.get('host', 'unknown')}"
+            )
+            sub_status = check_subscriber_status(subscriber_conn, sub_name)
+            subscriber_conn.close()
+            if sub_status:
+                status = (
+                    "ACTIVE" if not manually_connect_if_no_pid else "DISCONNECTED-BUT-ALIVE"
+                )
+            else:
+                status = "ORPHANED"
+        else:
+            logger.error(f"  [!] Failed to connect to subscriber.")
+            status = "ORPHANED"
+
+        # Save result
+        SUMMARY.append(
+            {
+                "Slot Name": slot_name,
+                "Subscription": sub_name,
+                "Subscriber Host": conn_params.get("host", "unknown"),
+                "Table": f"{schema}.{table_name}",
+                "Status": status,
+            }
+        )
+
+
+def check_subscriber_status(conn, sub_name) -> bool:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT received_lsn, latest_end_lsn, latest_end_time
+            FROM pg_stat_subscription
+            WHERE subname = %s
+        """,
+            (sub_name,),
+        )
+        result = cur.fetchone()
+        if result:
+            logger.info(
+                f"      - Subscription LSN: received={result['received_lsn']}, latest={result['latest_end_lsn']}"
+            )
+            return True
+        else:
+            logger.warning(f"      - No subscription status found for {sub_name}")
+            return False
+
+
+def print_summary():
+    if not SUMMARY:
+        logger.info("\nNo slots analyzed. No summary to print.")
+        return
+
+    logger.info("\nFinal Summary:\n")
+    headers = ["Slot Name", "Subscription", "Subscriber Host", "Table", "Status"]
+    row_format = "{:<40} {:<25} {:<20} {:<35} {:<8}"
+
+    print(row_format.format(*headers))
+    print("-" * 130)
+
+    for row in SUMMARY:
+        print(
+            row_format.format(
+                row["Slot Name"],
+                row["Subscription"],
+                row["Subscriber Host"],
+                row["Table"],
+                row["Status"],
+            )
+        )
+
+
+# --- Entry Point ---
 
 
 def main():
+    logger.info("Starting temporal slot checker...")
+    conn = None
     try:
-        conn = psycopg2.connect(
-            dbname=get_env_variable("PGDATABASE", "postgres"),
-            user=get_env_variable("PGUSER", "postgres"),
-            password=get_env_variable("PGPASSWORD"),
-            host=get_env_variable("PGHOST"),
-            port=int(get_env_variable("PGPORT", 5432)),
+        db_host = get_required_env_variable("PGHOST")
+        db_password = get_required_env_variable("PGPASSWORD")
+        db_name = get_env_variable("PGDATABASE", "postgres")
+        db_user = get_env_variable("PGUSER", "postgres")
+        db_port = int(get_env_variable("PGPORT", 5432))
+
+        conn = connect_db(
+            {
+                "host": db_host,
+                "port": db_port,
+                "dbname": db_name,
+                "user": db_user,
+                "password": db_password,
+            },
+            "Publisher",
         )
-        try:
-            decode_temporal_slots(conn)
-        finally:
-            conn.close()
-    except OperationalError as e:
-        logger.error(f"Failed to connect to the database: {e}")
+
+        if conn:
+            analyze_publisher_slots(conn)
+        else:
+            logger.error("Failed to connect to publisher. Exiting.")
+
     except Exception as e:
-        logger.error(f"An unexpected error occurred in main(): {e}")
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+    finally:
+        if conn:
+            conn.close()
+            logger.debug("Closed publisher connection.")
+
+    print_summary()
 
 
 if __name__ == "__main__":
